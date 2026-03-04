@@ -1,0 +1,475 @@
+import logging
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, ContextTypes
+from telethon import TelegramClient, errors
+from telethon.tl.functions.contacts import ResolveUsernameRequest
+import re
+import os
+import pickle
+from datetime import datetime
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Конфигурация бота
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Замените на токен вашего бота
+ADMIN_PASSWORD = "12345"  # Пароль для доступа к боту
+CRYPTO_WALLET = "0xAbCdEf123456789..."  # Ваш криптокошелек
+PHYSICAL_ACCOUNT_LINK = "https://t.me/mariaazk"  # Ссылка на физ.аккаунт
+API_ID = 12345  # Замените на ваш API ID (получить на my.telegram.org)
+API_HASH = "your_api_hash_here"  # Замените на ваш API Hash
+
+# Состояния для ConversationHandler
+ENTER_PASSWORD, MAILING_SETUP, MAILING_PHONE, MAILING_CODE, MAILING_PASSWORD, MAILING_MESSAGE, MAILING_USERNAMES = range(7)
+
+# База данных пользователей и профитов
+user_data = {}  # user_id: {"authenticated": bool, "profits": [], "total_cash": 0}
+user_sessions = {}  # user_id: {"client": TelegramClient, "phone": str, "session_file": str}
+
+# Путь к изображению
+PHOTO_PATH = "worker.jpg"  # Локальный файл или URL
+SESSIONS_DIR = "sessions"  # Папка для сохранения сессий
+
+# Создаем папку для сессий, если её нет
+if not os.path.exists(SESSIONS_DIR):
+    os.makedirs(SESSIONS_DIR)
+
+def get_main_menu_keyboard():
+    """Клавиатура главного меню"""
+    keyboard = [
+        [InlineKeyboardButton("🔥 | Профиль воркера", callback_data="profile")],
+        [InlineKeyboardButton("💰 | Ворк", callback_data="work"),
+         InlineKeyboardButton("🎁 | Физ.Аккаунт", callback_data="physical")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button():
+    """Кнопка 'Назад' для возврата в главное меню"""
+    keyboard = [[InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_work_menu_keyboard():
+    """Клавиатура меню 'Ворк'"""
+    keyboard = [
+        [InlineKeyboardButton("🦋 | Рассылка", callback_data="mailing")],
+        [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
+    # Инициализируем данные пользователя, если их нет
+    if user_id not in user_data:
+        user_data[user_id] = {"authenticated": False, "profits": [], "total_cash": 0}
+    
+    # Если пользователь уже аутентифицирован, показываем главное меню
+    if user_data[user_id]["authenticated"]:
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Запрашиваем пароль
+    await update.message.reply_text("🔒 Введите пароль для доступа к боту:")
+    return ENTER_PASSWORD
+
+async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка введенного пароля"""
+    user_id = update.effective_user.id
+    password = update.message.text
+    
+    if password == ADMIN_PASSWORD:
+        user_data[user_id]["authenticated"] = True
+        await update.message.reply_text("✅")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("❌ Неверный пароль. Попробуйте снова /start")
+        return ConversationHandler.END
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ главного меню"""
+    query = update.callback_query
+    
+    # Текст главного меню
+    text = (
+        "<b>🍷 | Бот воркера</b>\n\n"
+        "<blockquote>• Для начала работы , перейдите в нужный раздел:</blockquote>\n\n"
+        "<b>🦅 | Удачного ворка!</b>"
+    )
+    
+    if query:
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+        await query.answer()
+    else:
+        await update.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await query.message.reply_text("❌ Пожалуйста, авторизуйтесь через /start")
+        await query.answer()
+        return
+    
+    # Профиль воркера
+    if query.data == "profile":
+        profits_count = len(user_data[user_id]["profits"])
+        total_cash = user_data[user_id]["total_cash"]
+        
+        text = (
+            f"<b>Мой профиль 🔥</b>\n\n"
+            f"<b>Воркер: #moyz3s</b>\n"
+            f"• Криптокошелек: {CRYPTO_WALLET}\n"
+            f"• Кол-во профитов: {profits_count}\n"
+            f"Общая касса: {total_cash} руб.\n\n"
+            f"🦅"
+        )
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_back_button()
+        )
+        await query.answer()
+    
+    # Меню "Ворк"
+    elif query.data == "work":
+        text = "<blockquote>💼 | Выберите помощник для ворка:</blockquote>"
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Физический аккаунт
+    elif query.data == "physical":
+        await query.message.reply_text(f"Переход на физический аккаунт: {PHYSICAL_ACCOUNT_LINK}")
+        await query.answer()
+    
+    # Назад в главное меню
+    elif query.data == "back_to_main":
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Рассылка
+    elif query.data == "mailing":
+        await query.message.delete()
+        await query.message.reply_text(
+            "📨 <b>Настройка рассылки</b>\n\n"
+            "Сейчас мы подключим ваш аккаунт для рассылки.\n"
+            "Для этого мне понадобятся данные для входа.\n\n"
+            "Введите номер телефона в международном формате (например, +79001234567):",
+            parse_mode='HTML'
+        )
+        context.user_data['mailing_step'] = 'phone'
+        return MAILING_PHONE
+
+async def mailing_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение номера телефона для авторизации"""
+    phone = update.message.text
+    user_id = update.effective_user.id
+    
+    # Проверяем, есть ли уже сохраненная сессия
+    session_file = f"{SESSIONS_DIR}/{user_id}.session"
+    
+    if os.path.exists(session_file):
+        # Загружаем существующую сессию
+        await update.message.reply_text("🔄 Обнаружена сохраненная сессия. Подключаюсь...")
+        client = TelegramClient(session_file, API_ID, API_HASH)
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            user_sessions[user_id] = {"client": client, "phone": phone, "session_file": session_file}
+            await update.message.reply_text("✅ Успешное подключение к аккаунту!")
+            await ask_mailing_message(update, context)
+            return MAILING_MESSAGE
+        else:
+            os.remove(session_file)  # Удаляем нерабочую сессию
+    
+    # Новая авторизация
+    context.user_data['mailing_phone'] = phone
+    
+    client = TelegramClient(session_file, API_ID, API_HASH)
+    await client.connect()
+    
+    try:
+        # Отправляем код подтверждения
+        await client.send_code_request(phone)
+        user_sessions[user_id] = {"client": client, "phone": phone, "session_file": session_file}
+        
+        await update.message.reply_text(
+            "📱 На ваш Telegram пришел код подтверждения.\n"
+            "Введите код (только цифры):"
+        )
+        return MAILING_CODE
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        return ConversationHandler.END
+
+async def mailing_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение кода подтверждения"""
+    code = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    client = user_sessions[user_id]["client"]
+    phone = context.user_data.get('mailing_phone')
+    
+    try:
+        await client.sign_in(phone, code)
+        
+        # Сохраняем сессию
+        await client.disconnect()
+        await client.connect()  # Переподключаемся для сохранения
+        
+        await update.message.reply_text("✅ Успешная авторизация!")
+        await ask_mailing_message(update, context)
+        return MAILING_MESSAGE
+        
+    except errors.SessionPasswordNeededError:
+        # Запрашиваем облачный пароль (2FA)
+        await update.message.reply_text(
+            "🔐 На аккаунте включена двухфакторная аутентификация.\n"
+            "Введите облачный пароль:"
+        )
+        return MAILING_PASSWORD
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        return ConversationHandler.END
+
+async def mailing_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение облачного пароля (2FA)"""
+    password = update.message.text
+    user_id = update.effective_user.id
+    
+    client = user_sessions[user_id]["client"]
+    
+    try:
+        await client.sign_in(password=password)
+        
+        # Сохраняем сессию
+        await client.disconnect()
+        await client.connect()
+        
+        await update.message.reply_text("✅ Успешная авторизация с 2FA!")
+        await ask_mailing_message(update, context)
+        return MAILING_MESSAGE
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        return ConversationHandler.END
+
+async def ask_mailing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запрос текста для рассылки"""
+    await update.message.reply_text(
+        "📝 <b>Текст рассылки</b>\n\n"
+        "Введите текст сообщения, которое нужно разослать пользователям:",
+        parse_mode='HTML'
+    )
+
+async def mailing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение текста для рассылки"""
+    message_text = update.message.text
+    context.user_data['mailing_text'] = message_text
+    
+    await update.message.reply_text(
+        "👥 <b>Получатели</b>\n\n"
+        "Введите юзернеймы получателей через пробел или запятую.\n"
+        "Пример: @user1 @user2 @user3\n\n"
+        "Или отправьте 'отмена' для выхода:",
+        parse_mode='HTML'
+    )
+    return MAILING_USERNAMES
+
+async def mailing_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение списка юзернеймов и запуск рассылки"""
+    text = update.message.text.strip()
+    
+    if text.lower() == 'отмена':
+        await update.message.reply_text("❌ Рассылка отменена")
+        return ConversationHandler.END
+    
+    # Парсим юзернеймы
+    usernames = re.findall(r'@(\w+)', text)
+    
+    if not usernames:
+        await update.message.reply_text(
+            "❌ Не найдено ни одного юзернейма. Попробуйте снова:"
+        )
+        return MAILING_USERNAMES
+    
+    user_id = update.effective_user.id
+    message_text = context.user_data['mailing_text']
+    
+    await update.message.reply_text(
+        f"📨 <b>Запуск рассылки</b>\n\n"
+        f"Всего получателей: {len(usernames)}\n"
+        f"Текст: {message_text[:50]}...\n\n"
+        f"Рассылка началась...",
+        parse_mode='HTML'
+    )
+    
+    # Запускаем рассылку
+    client = user_sessions[user_id]["client"]
+    
+    results = {
+        'success': 0,
+        'failed': 0,
+        'blocked': 0,
+        'deactivated': 0,
+        'details': []
+    }
+    
+    status_message = await update.message.reply_text("🔄 Прогресс: 0%")
+    
+    for i, username in enumerate(usernames):
+        try:
+            # Получаем пользователя по юзернейму
+            entity = await client.get_entity(username)
+            
+            # Отправляем сообщение
+            await client.send_message(entity, message_text)
+            
+            results['success'] += 1
+            results['details'].append(f"✅ @{username} - успешно")
+            
+        except errors.FloodWaitError as e:
+            wait_time = e.seconds
+            results['failed'] += 1
+            results['details'].append(f"⚠️ @{username} - флуд-контроль, ожидание {wait_time}с")
+            await asyncio.sleep(wait_time)
+            
+        except errors.UserIsBlockedError:
+            results['blocked'] += 1
+            results['details'].append(f"❌ @{username} - пользователь заблокировал бота/аккаунт")
+            
+        except errors.UserDeactivatedError:
+            results['deactivated'] += 1
+            results['details'].append(f"❌ @{username} - аккаунт удален/деактивирован")
+            
+        except Exception as e:
+            results['failed'] += 1
+            results['details'].append(f"❌ @{username} - ошибка: {str(e)[:50]}")
+        
+        # Обновляем прогресс
+        if (i + 1) % 5 == 0 or i == len(usernames) - 1:
+            progress = int((i + 1) / len(usernames) * 100)
+            await status_message.edit_text(f"🔄 Прогресс: {progress}%")
+    
+    # Формируем отчет
+    report = (
+        f"📊 <b>Отчет о рассылке</b>\n\n"
+        f"✅ Успешно: {results['success']}\n"
+        f"❌ Неудачно: {results['failed']}\n"
+        f"🚫 Заблокировали: {results['blocked']}\n"
+        f"💀 Аккаунты удалены: {results['deactivated']}\n\n"
+        f"<b>Детали:</b>\n"
+    )
+    
+    # Добавляем первые 10 деталей (чтобы не спамить)
+    for detail in results['details'][:10]:
+        report += f"{detail}\n"
+    
+    if len(results['details']) > 10:
+        report += f"... и еще {len(results['details']) - 10}"
+    
+    await update.message.reply_text(report, parse_mode='HTML')
+    
+    # Очищаем временные данные
+    context.user_data.clear()
+    
+    # Возвращаемся в главное меню
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+async def add_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для добавления профита"""
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await update.message.reply_text("❌ Вы не авторизованы")
+        return
+    
+    try:
+        amount = int(context.args[0])
+        user_data[user_id]["profits"].append(amount)
+        user_data[user_id]["total_cash"] += amount
+        await update.message.reply_text(f"✅ Профит {amount} руб. добавлен!")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /profit [сумма]")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена текущего действия"""
+    await update.message.reply_text("❌ Действие отменено")
+    return ConversationHandler.END
+
+async def mailing_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена рассылки"""
+    await update.message.reply_text("❌ Рассылка отменена")
+    return ConversationHandler.END
+
+def main():
+    """Запуск бота"""
+    # Проверяем наличие API_ID и API_HASH
+    if API_ID == 12345 or API_HASH == "your_api_hash_here":
+        print("⚠️ ВНИМАНИЕ: Не забудьте указать API_ID и API_HASH!")
+        print("Получить их можно на https://my.telegram.org")
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # ConversationHandler для авторизации в боте
+    auth_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            ENTER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    # ConversationHandler для рассылки
+    mailing_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^mailing$')],
+        states={
+            MAILING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_phone)],
+            MAILING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_code)],
+            MAILING_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_password)],
+            MAILING_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_message)],
+            MAILING_USERNAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_usernames)],
+        },
+        fallbacks=[CommandHandler('cancel', mailing_cancel)],
+        allow_reentry=True,
+    )
+    
+    application.add_handler(auth_conv_handler)
+    application.add_handler(mailing_conv_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("profit", add_profit))
+    
+    print("🚀 Бот запущен...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
