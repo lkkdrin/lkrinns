@@ -1,0 +1,256 @@
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ConversationHandler, ContextTypes
+import re
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Конфигурация бота
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Замените на токен вашего бота
+ADMIN_PASSWORD = "12345"  # Пароль для доступа к боту
+CRYPTO_WALLET = "0xAbCdEf123456789..."  # Ваш криптокошелек
+PHYSICAL_ACCOUNT_LINK = "https://t.me/mariaazk"  # Ссылка на физ.аккаунт
+
+# Состояния для ConversationHandler
+ENTER_PASSWORD = 1
+
+# База данных пользователей и профитов (в реальном проекте используйте БД)
+user_data = {}  # user_id: {"authenticated": bool, "profits": [], "total_cash": 0}
+
+# Путь к изображению (замените на свой файл или URL)
+PHOTO_PATH = "worker.jpg"  # Локальный файл или URL
+
+def get_main_menu_keyboard():
+    """Клавиатура главного меню"""
+    keyboard = [
+        [InlineKeyboardButton("🔥 | Профиль воркера", callback_data="profile")],
+        [InlineKeyboardButton("💰 | Ворк", callback_data="work"),
+         InlineKeyboardButton("🎁 | Физ.Аккаунт", callback_data="physical")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button():
+    """Кнопка 'Назад' для возврата в главное меню"""
+    keyboard = [[InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_work_menu_keyboard():
+    """Клавиатура меню 'Ворк'"""
+    keyboard = [
+        [InlineKeyboardButton("🦋 | Рассылка", callback_data="mailing")],
+        [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
+    # Инициализируем данные пользователя, если их нет
+    if user_id not in user_data:
+        user_data[user_id] = {"authenticated": False, "profits": [], "total_cash": 0}
+    
+    # Если пользователь уже аутентифицирован, показываем главное меню
+    if user_data[user_id]["authenticated"]:
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Запрашиваем пароль
+    await update.message.reply_text("🔒 Введите пароль для доступа к боту:")
+    return ENTER_PASSWORD
+
+async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка введенного пароля"""
+    user_id = update.effective_user.id
+    password = update.message.text
+    
+    if password == ADMIN_PASSWORD:
+        user_data[user_id]["authenticated"] = True
+        await update.message.reply_text("✅")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("❌ Неверный пароль. Попробуйте снова /start")
+        return ConversationHandler.END
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ главного меню"""
+    query = update.callback_query
+    
+    # Текст главного меню
+    text = (
+        "<b>🍷 | Бот воркера</b>\n\n"
+        "<blockquote>• Для начала работы , перейдите в нужный раздел:</blockquote>\n\n"
+        "<b>🦅 | Удачного ворка!</b>"
+    )
+    
+    if query:
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if PHOTO_PATH.startswith('/') else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+        await query.answer()
+    else:
+        await update.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if PHOTO_PATH.startswith('/') else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await query.message.reply_text("❌ Пожалуйста, авторизуйтесь через /start")
+        await query.answer()
+        return
+    
+    # Профиль воркера
+    if query.data == "profile":
+        profits_count = len(user_data[user_id]["profits"])
+        total_cash = user_data[user_id]["total_cash"]
+        
+        text = (
+            f"<b>Мой профиль 🔥</b>\n\n"
+            f"<b>Воркер: #moyz3s</b>\n"
+            f"• Криптокошелек: {CRYPTO_WALLET}\n"
+            f"• Кол-во профитов: {profits_count}\n"
+            f"Общая касса: {total_cash} руб.\n\n"
+            f"🦅"
+        )
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if PHOTO_PATH.startswith('/') else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_back_button()
+        )
+        await query.answer()
+    
+    # Меню "Ворк"
+    elif query.data == "work":
+        text = "<blockquote>💼 | Выберите помощник для ворка:</blockquote>"
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if PHOTO_PATH.startswith('/') else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Физический аккаунт
+    elif query.data == "physical":
+        await query.message.reply_text(f"Переход на физический аккаунт: {PHYSICAL_ACCOUNT_LINK}")
+        await query.answer()
+    
+    # Назад в главное меню
+    elif query.data == "back_to_main":
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Рассылка
+    elif query.data == "mailing":
+        await query.message.reply_text(
+            "📨 Функция рассылки в разработке.\n"
+            "Для отправки сообщения используйте команду:\n"
+            "/send @username1 @username2 Текст сообщения"
+        )
+        await query.answer()
+
+async def add_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для добавления профита (только для авторизованных пользователей)"""
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await update.message.reply_text("❌ Вы не авторизованы")
+        return
+    
+    try:
+        # Формат: /profit 1000
+        amount = int(context.args[0])
+        user_data[user_id]["profits"].append(amount)
+        user_data[user_id]["total_cash"] += amount
+        await update.message.reply_text(f"✅ Профит {amount} руб. добавлен!")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /profit [сумма]")
+
+async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для рассылки сообщений (упрощенная версия)"""
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await update.message.reply_text("❌ Вы не авторизованы")
+        return
+    
+    # Простой парсинг аргументов
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /send @username1 @username2 ... Текст сообщения")
+        return
+    
+    # Извлекаем юзернеймы (начинаются с @)
+    usernames = []
+    message_parts = []
+    
+    for arg in context.args:
+        if arg.startswith('@'):
+            usernames.append(arg)
+        else:
+            message_parts.append(arg)
+    
+    message_text = ' '.join(message_parts)
+    
+    if not usernames or not message_text:
+        await update.message.reply_text("Укажите получателей и текст сообщения")
+        return
+    
+    await update.message.reply_text(
+        f"📨 Рассылка запущена для {len(usernames)} пользователей\n"
+        f"Сообщение: {message_text}"
+    )
+    
+    # Здесь должна быть реальная рассылка, но для этого нужны дополнительные разрешения
+    # В текущей версии Telegram API бот не может инициировать диалог с пользователем
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена текущего действия"""
+    await update.message.reply_text("Действие отменено")
+    return ConversationHandler.END
+
+def main():
+    """Запуск бота"""
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # ConversationHandler для обработки ввода пароля
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            ENTER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("profit", add_profit))
+    application.add_handler(CommandHandler("send", send_message))
+    
+    # Запускаем бота
+    print("Бот запущен...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
