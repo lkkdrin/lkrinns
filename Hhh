@@ -1,0 +1,889 @@
+import logging
+import asyncio
+import os
+import re
+import sqlite3
+import io
+import qrcode
+import base64
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    filters, CallbackQueryHandler, ConversationHandler, ContextTypes
+)
+from telethon import TelegramClient, functions, types
+from telethon.errors import (
+    FloodWaitError, 
+    SessionPasswordNeededError,
+    PasswordHashInvalidError
+)
+from telethon.tl.types import CodeSettings
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== КОНФИГУРАЦИЯ ====================
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Токен бота от @BotFather
+ADMIN_PASSWORD = "12345"  # Пароль для доступа к боту
+CRYPTO_WALLET = "0xAbCdEf123456789..."  # Ваш криптокошелек
+PHYSICAL_ACCOUNT_LINK = "https://t.me/mariaazk"  # Ссылка на физ.аккаунт
+API_ID = 12345  # API ID с my.telegram.org
+API_HASH = "your_api_hash_here"  # API Hash с my.telegram.org
+PHOTO_PATH = "worker.jpg"  # Путь к фото
+SESSIONS_DIR = "sessions"  # Папка с сессиями
+
+# ==================== СОСТОЯНИЯ ====================
+ENTER_PASSWORD, QR_AUTH, TWO_FA_PASSWORD, MAILING_MESSAGE, MAILING_USERNAMES = range(5)
+
+# ==================== ПРОВЕРКА КОНФИГУРАЦИИ ====================
+def check_config():
+    """Проверяет наличие всех необходимых параметров"""
+    errors = []
+    
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        errors.append("❌ Не указан BOT_TOKEN")
+    
+    if API_ID == 12345:
+        errors.append("❌ Не указан API_ID")
+    
+    if API_HASH == "your_api_hash_here":
+        errors.append("❌ Не указан API_HASH")
+    
+    if errors:
+        print("\n".join(errors))
+        print("\n⚠️ Исправьте ошибки в конфигурации и перезапустите бота!")
+        return False
+    
+    return True
+
+# ==================== РАБОТА С СЕССИЯМИ ====================
+class SessionManager:
+    """Класс для управления сессиями Telethon"""
+    
+    def __init__(self, sessions_dir=SESSIONS_DIR):
+        self.sessions_dir = sessions_dir
+        self.active_sessions: Dict[int, TelegramClient] = {}
+        self.auth_clients: Dict[int, Dict[str, Any]] = {}
+        
+        # Создаем папку для сессий
+        os.makedirs(self.sessions_dir, exist_ok=True)
+        
+        logger.info(f"📁 Папка с сессиями: {os.path.abspath(self.sessions_dir)}")
+    
+    def find_session_file(self, user_id: int) -> Optional[str]:
+        """Находит файл сессии для пользователя"""
+        # Сначала ищем по точному имени
+        exact_file = os.path.join(self.sessions_dir, f"{user_id}.session")
+        if os.path.exists(exact_file):
+            return exact_file
+        
+        # Если не нашли, ищем любой .session файл
+        session_files = list(Path(self.sessions_dir).glob("*.session"))
+        if session_files:
+            # Исключаем временные файлы
+            for f in session_files:
+                if not f.name.startswith("temp_"):
+                    return str(f)
+        
+        return None
+    
+    def validate_session_file(self, session_file: str) -> bool:
+        """Проверяет, является ли файл корректной сессией Telethon"""
+        if not os.path.exists(session_file):
+            logger.error(f"❌ Файл не существует: {session_file}")
+            return False
+        
+        # Проверяем размер файла
+        file_size = os.path.getsize(session_file)
+        if file_size < 100:
+            logger.error(f"❌ Файл слишком мал ({file_size} байт): {session_file}")
+            return False
+        
+        # Проверяем, что это SQLite база данных
+        try:
+            conn = sqlite3.connect(session_file)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = cursor.fetchall()
+            conn.close()
+            
+            # Проверяем наличие таблицы sessions
+            table_names = [t[0] for t in tables]
+            if 'sessions' not in table_names:
+                logger.error(f"❌ Файл не содержит таблицу 'sessions': {session_file}")
+                return False
+            
+            logger.info(f"✅ Файл сессии прошел проверку: {session_file}")
+            return True
+            
+        except sqlite3.DatabaseError as e:
+            logger.error(f"❌ Файл не является SQLite базой: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки файла: {e}")
+            return False
+    
+    async def load_session(self, user_id: int) -> Optional[TelegramClient]:
+        """Загружает сессию для пользователя"""
+        # Если сессия уже загружена, возвращаем её
+        if user_id in self.active_sessions:
+            client = self.active_sessions[user_id]
+            try:
+                if client.is_connected() and await client.is_user_authorized():
+                    logger.info(f"✅ Использую уже загруженную сессию для user_id: {user_id}")
+                    return client
+                else:
+                    # Если клиент не работает, удаляем его
+                    del self.active_sessions[user_id]
+            except:
+                del self.active_sessions[user_id]
+        
+        # Ищем файл сессии
+        session_file = self.find_session_file(user_id)
+        
+        if not session_file:
+            logger.warning(f"⚠️ Файл сессии не найден для user_id: {user_id}")
+            return None
+        
+        # Загружаем сессию
+        try:
+            client = TelegramClient(session_file, API_ID, API_HASH)
+            await client.connect()
+            
+            # Проверяем авторизацию
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                logger.info(f"✅ Сессия успешно загружена для @{me.username} (ID: {me.id})")
+                
+                # Сохраняем в активные сессии
+                self.active_sessions[user_id] = client
+                
+                # Если файл назывался не по user_id, переименовываем
+                expected_name = os.path.join(self.sessions_dir, f"{user_id}.session")
+                if session_file != expected_name and not os.path.exists(expected_name):
+                    try:
+                        os.rename(session_file, expected_name)
+                        logger.info(f"📝 Файл переименован в {expected_name}")
+                    except:
+                        pass
+                
+                return client
+            else:
+                logger.error(f"❌ Сессия не авторизована: {session_file}")
+                await client.disconnect()
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки сессии: {e}")
+            
+            # Если ошибка связана с базой данных, удаляем файл
+            if "file is not a database" in str(e):
+                logger.warning(f"🗑 Удаляем поврежденный файл: {session_file}")
+                try:
+                    os.remove(session_file)
+                except:
+                    pass
+            
+            return None
+    
+    async def create_qr_client(self, user_id: int) -> TelegramClient:
+        """Создает временного клиента для QR-авторизации"""
+        session_file = os.path.join(self.sessions_dir, f"temp_{user_id}.session")
+        
+        # Удаляем старый временный файл, если есть
+        if os.path.exists(session_file):
+            try:
+                os.remove(session_file)
+            except:
+                pass
+        
+        client = TelegramClient(session_file, API_ID, API_HASH)
+        await client.connect()
+        
+        return client
+    
+    async def generate_qr(self, user_id: int) -> tuple[Optional[bytes], Optional[str]]:
+        """Генерирует QR-код для авторизации"""
+        try:
+            # Создаем временного клиента
+            client = await self.create_qr_client(user_id)
+            
+            # Запрашиваем токен для QR
+            result = await client(functions.auth.ExportLoginTokenRequest(
+                api_id=API_ID,
+                api_hash=API_HASH,
+                except_ids=[]
+            ))
+            
+            # Сохраняем клиент и токен
+            self.auth_clients[user_id] = {
+                'client': client,
+                'token': result.token,
+                'expires': result.expires,
+                'created_at': time.time()
+            }
+            
+            # Формируем ссылку для QR
+            token_b64 = base64.b64encode(result.token).decode('utf-8')
+            qr_link = f"tg://login?token={token_b64}"
+            
+            # Генерируем QR-код
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            
+            qr.add_data(qr_link)
+            qr.make(fit=True)
+            
+            # Создаем изображение
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # Конвертируем в байты
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+            
+            return img_bytes.getvalue(), token_b64
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка генерации QR: {e}")
+            return None, None
+    
+    async def check_qr_login(self, user_id: int, two_fa_password: str = None) -> tuple[Optional[TelegramClient], str]:
+        """
+        Проверяет, выполнен ли вход по QR
+        Возвращает (клиент, статус)
+        Статусы: 'success', '2fa', 'wrong_password', 'expired', 'waiting', 'error'
+        """
+        if user_id not in self.auth_clients:
+            return None, 'no_session'
+        
+        auth_data = self.auth_clients[user_id]
+        client = auth_data['client']
+        
+        try:
+            # Проверяем, не истек ли токен (60 секунд)
+            if time.time() - auth_data['created_at'] > 60:
+                logger.warning(f"⚠️ Токен истек для user_id: {user_id}")
+                return None, 'expired'
+            
+            # Проверяем, авторизован ли уже клиент
+            if await client.is_user_authorized():
+                return await self._finalize_session(user_id, client), 'success'
+            
+            # Если передан пароль 2FA
+            if two_fa_password:
+                try:
+                    # Пробуем войти с паролем
+                    await client.sign_in(password=two_fa_password)
+                    
+                    # Проверяем авторизацию
+                    if await client.is_user_authorized():
+                        return await self._finalize_session(user_id, client), 'success'
+                    else:
+                        return None, 'waiting'
+                        
+                except PasswordHashInvalidError:
+                    return None, 'wrong_password'
+                except SessionPasswordNeededError:
+                    # Все еще требуется 2FA
+                    return None, '2fa'
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при 2FA: {e}")
+                    return None, 'error'
+            
+            # Проверяем, нужно ли ввести пароль 2FA
+            try:
+                # Пытаемся импортировать токен
+                await client(functions.auth.ImportLoginTokenRequest(
+                    token=auth_data['token']
+                ))
+                
+                # Если успешно, проверяем авторизацию
+                if await client.is_user_authorized():
+                    return await self._finalize_session(user_id, client), 'success'
+                else:
+                    return None, 'waiting'
+                    
+            except SessionPasswordNeededError:
+                # Требуется 2FA
+                logger.info(f"🔐 Требуется 2FA для user_id: {user_id}")
+                return None, '2fa'
+                
+            except Exception as e:
+                if "AUTH_TOKEN_ALREADY_ACCEPTED" in str(e):
+                    # Токен уже принят - проверяем авторизацию
+                    if await client.is_user_authorized():
+                        return await self._finalize_session(user_id, client), 'success'
+                
+                logger.debug(f"Ошибка импорта токена: {e}")
+                return None, 'waiting'
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки QR: {e}")
+            return None, 'error'
+    
+    async def _finalize_session(self, user_id: int, client: TelegramClient) -> TelegramClient:
+        """Завершает настройку сессии после успешного входа"""
+        try:
+            me = await client.get_me()
+            logger.info(f"✅ QR-авторизация успешна для @{me.username}")
+            
+            # Сохраняем постоянную сессию
+            permanent_file = os.path.join(self.sessions_dir, f"{user_id}.session")
+            temp_file = os.path.join(self.sessions_dir, f"temp_{user_id}.session")
+            
+            # Сохраняем сессию
+            await client.disconnect()
+            await client.connect()
+            
+            # Перемещаем файл из временного в постоянный
+            if os.path.exists(temp_file):
+                if os.path.exists(permanent_file):
+                    try:
+                        os.remove(permanent_file)
+                    except:
+                        pass
+                try:
+                    os.rename(temp_file, permanent_file)
+                    logger.info(f"📁 Сессия сохранена: {permanent_file}")
+                except Exception as e:
+                    logger.error(f"Ошибка переименования файла: {e}")
+            
+            # Сохраняем в активные сессии
+            self.active_sessions[user_id] = client
+            
+            # Удаляем временные данные
+            if user_id in self.auth_clients:
+                del self.auth_clients[user_id]
+            
+            return client
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при финализации сессии: {e}")
+            return client
+    
+    async def close_session(self, user_id: int):
+        """Закрывает сессию пользователя"""
+        if user_id in self.active_sessions:
+            try:
+                await self.active_sessions[user_id].disconnect()
+            except:
+                pass
+            del self.active_sessions[user_id]
+            logger.info(f"🔒 Сессия закрыта для user_id: {user_id}")
+        
+        # Закрываем временные клиенты
+        if user_id in self.auth_clients:
+            try:
+                await self.auth_clients[user_id]['client'].disconnect()
+            except:
+                pass
+            del self.auth_clients[user_id]
+
+# ==================== ИНИЦИАЛИЗАЦИЯ ====================
+session_manager = SessionManager()
+user_data = {}  # Данные пользователей бота
+
+# ==================== КЛАВИАТУРЫ ====================
+def get_main_menu_keyboard():
+    """Клавиатура главного меню"""
+    keyboard = [
+        [InlineKeyboardButton("🔥 | Профиль воркера", callback_data="profile")],
+        [InlineKeyboardButton("💰 | Ворк", callback_data="work"),
+         InlineKeyboardButton("🎁 | Физ.Аккаунт", callback_data="physical")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button():
+    """Кнопка 'Назад'"""
+    keyboard = [[InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_work_menu_keyboard():
+    """Клавиатура меню 'Ворк'"""
+    keyboard = [
+        [InlineKeyboardButton("🦋 | Рассылка", callback_data="mailing")],
+        [InlineKeyboardButton("📱 | QR-вход", callback_data="qr_auth")],
+        [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_qr_menu_keyboard():
+    """Клавиатура для QR-авторизации"""
+    keyboard = [
+        [InlineKeyboardButton("🔄 | Проверить вход", callback_data="check_qr")],
+        [InlineKeyboardButton("❌ | Отмена", callback_data="back_to_work")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_2fa_menu_keyboard():
+    """Клавиатура для 2FA"""
+    keyboard = [
+        [InlineKeyboardButton("❌ | Отмена", callback_data="cancel_2fa")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
+    # Инициализируем данные пользователя
+    if user_id not in user_data:
+        user_data[user_id] = {"authenticated": False, "profits": [], "total_cash": 0}
+    
+    # Если пользователь уже аутентифицирован, показываем меню
+    if user_data[user_id]["authenticated"]:
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Запрашиваем пароль
+    await update.message.reply_text("🔒 Введите пароль для доступа к боту:")
+    return ENTER_PASSWORD
+
+async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка пароля"""
+    user_id = update.effective_user.id
+    
+    if update.message.text == ADMIN_PASSWORD:
+        user_data[user_id]["authenticated"] = True
+        await update.message.reply_text("✅")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("❌ Неверный пароль. Попробуйте /start")
+        return ConversationHandler.END
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ главного меню"""
+    query = update.callback_query
+    
+    text = (
+        "<b>🍷 | Бот воркера</b>\n\n"
+        "<blockquote>• Для начала работы , перейдите в нужный раздел:</blockquote>\n\n"
+        "<b>🦅 | Удачного ворка!</b>"
+    )
+    
+    photo = open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH
+    
+    if query:
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=photo,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+        await query.answer()
+    else:
+        await update.message.reply_photo(
+            photo=photo,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    if not user_data.get(user_id, {}).get("authenticated", False):
+        await query.message.reply_text("❌ Авторизуйтесь через /start")
+        await query.answer()
+        return
+    
+    # Профиль
+    if query.data == "profile":
+        profits = user_data[user_id]["profits"]
+        total = user_data[user_id]["total_cash"]
+        
+        text = (
+            f"<b>Мой профиль 🔥</b>\n\n"
+            f"<b>Воркер: #moyz3s</b>\n"
+            f"• Криптокошелек: {CRYPTO_WALLET}\n"
+            f"• Кол-во профитов: {len(profits)}\n"
+            f"Общая касса: {total} руб.\n\n"
+            f"🦅"
+        )
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_back_button()
+        )
+        await query.answer()
+    
+    # Меню "Ворк"
+    elif query.data == "work":
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption="<blockquote>💼 | Выберите помощник для ворка:</blockquote>",
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Назад в главное меню
+    elif query.data == "back_to_main":
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Назад в меню "Ворк"
+    elif query.data == "back_to_work":
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption="<blockquote>💼 | Выберите помощник для ворка:</blockquote>",
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Отмена 2FA
+    elif query.data == "cancel_2fa":
+        if user_id in session_manager.auth_clients:
+            await session_manager.close_session(user_id)
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption="<blockquote>💼 | Выберите помощник для ворка:</blockquote>",
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Физический аккаунт
+    elif query.data == "physical":
+        await query.message.reply_text(f"Переход: {PHYSICAL_ACCOUNT_LINK}")
+        await query.answer()
+    
+    # QR-авторизация
+    elif query.data == "qr_auth":
+        await query.message.delete()
+        
+        # Проверяем, есть ли уже готовая сессия
+        client = await session_manager.load_session(user_id)
+        
+        if client:
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Уже есть активная сессия!</b>\n\n"
+                f"Аккаунт: @{me.username} (ID: {me.id})",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Генерируем QR-код
+        await query.message.reply_text("🔄 Генерирую QR-код для входа...")
+        
+        qr_bytes, token = await session_manager.generate_qr(user_id)
+        
+        if qr_bytes:
+            # Отправляем QR-код
+            await query.message.reply_photo(
+                photo=qr_bytes,
+                caption=(
+                    "📱 <b>QR-код для входа в Telegram</b>\n\n"
+                    "1️⃣ Откройте Telegram на телефоне\n"
+                    "2️⃣ Перейдите в Настройки → Устройства\n"
+                    "3️⃣ Нажмите 'Сканировать QR-код'\n"
+                    "4️⃣ Отсканируйте этот код\n\n"
+                    "⏱ Код действителен 60 секунд\n\n"
+                    "⚠️ <b>Если у вас включена двухфакторная аутентификация (2FA),\n"
+                    "после сканирования потребуется ввести пароль</b>"
+                ),
+                parse_mode='HTML',
+                reply_markup=get_qr_menu_keyboard()
+            )
+            
+            # Запускаем фоновую задачу для проверки входа
+            asyncio.create_task(check_qr_login_task(user_id, context))
+        else:
+            await query.message.reply_text("❌ Ошибка генерации QR-кода")
+    
+    # Проверка QR-входа
+    elif query.data == "check_qr":
+        await query.answer()
+        
+        client, status = await session_manager.check_qr_login(user_id)
+        
+        if status == 'success' and client:
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Успешный вход!</b>\n\n"
+                f"Аккаунт: @{me.username} (ID: {me.id})\n"
+                f"Сессия сохранена в папке sessions/",
+                parse_mode='HTML'
+            )
+        elif status == '2fa':
+            await query.message.reply_text(
+                "🔐 <b>Требуется двухфакторная аутентификация</b>\n\n"
+                "Введите ваш облачный пароль в Telegram на телефоне,\n"
+                "затем нажмите 'Проверить вход' снова.\n\n"
+                "Или введите пароль здесь (если хотите ввести в боте):",
+                parse_mode='HTML',
+                reply_markup=get_2fa_menu_keyboard()
+            )
+            return TWO_FA_PASSWORD
+        elif status == 'expired':
+            await query.message.reply_text(
+                "❌ <b>Срок действия QR-кода истек</b>\n\n"
+                "Нажмите 'QR-вход' снова, чтобы получить новый код.",
+                parse_mode='HTML'
+            )
+        elif status == 'waiting':
+            await query.message.reply_text(
+                "⏳ Ожидание сканирования QR-кода...\n"
+                "Отсканируйте код в Telegram и нажмите 'Проверить вход' снова."
+            )
+        else:
+            await query.message.reply_text(
+                "⏳ Вход еще не выполнен. Отсканируйте QR-код в Telegram."
+            )
+    
+    # Рассылка
+    elif query.data == "mailing":
+        await query.message.delete()
+        
+        # Пытаемся загрузить сессию
+        client = await session_manager.load_session(user_id)
+        
+        if client:
+            # Сессия есть и работает
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Сессия загружена!</b>\n\n"
+                f"Аккаунт: @{me.username}",
+                parse_mode='HTML'
+            )
+            
+            # Запрашиваем текст рассылки
+            await query.message.reply_text(
+                "📝 <b>Текст рассылки</b>\n\n"
+                "Введите текст сообщения для рассылки:",
+                parse_mode='HTML'
+            )
+            return MAILING_MESSAGE
+        else:
+            # Сессии нет
+            await query.message.reply_text(
+                "❌ <b>Сессия не найдена</b>\n\n"
+                "Сначала выполните вход через QR-код в разделе 'QR-вход'",
+                parse_mode='HTML'
+            )
+
+async def two_fa_password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ввода пароля 2FA"""
+    user_id = update.effective_user.id
+    password = update.message.text
+    
+    if password.lower() == 'отмена':
+        await session_manager.close_session(user_id)
+        await update.message.reply_text("❌ Вход отменен")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Отправляем сообщение о проверке
+    status_msg = await update.message.reply_text("🔄 Проверка пароля...")
+    
+    # Пытаемся войти с паролем
+    client, status = await session_manager.check_qr_login(user_id, password)
+    
+    await status_msg.delete()
+    
+    if status == 'success' and client:
+        me = await client.get_me()
+        await update.message.reply_text(
+            f"✅ <b>Успешный вход с 2FA!</b>\n\n"
+            f"Аккаунт: @{me.username} (ID: {me.id})\n"
+            f"Сессия сохранена в папке sessions/",
+            parse_mode='HTML'
+        )
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+        
+    elif status == 'wrong_password':
+        await update.message.reply_text(
+            "❌ <b>Неверный пароль</b>\n\n"
+            "Попробуйте снова или отправьте 'отмена' для выхода:",
+            parse_mode='HTML',
+            reply_markup=get_2fa_menu_keyboard()
+        )
+        return TWO_FA_PASSWORD
+        
+    elif status == 'expired':
+        await update.message.reply_text(
+            "❌ <b>Срок действия QR-кода истек</b>\n\n"
+            "Нажмите 'QR-вход' снова, чтобы получить новый код.",
+            parse_mode='HTML'
+        )
+        await session_manager.close_session(user_id)
+        return ConversationHandler.END
+        
+    else:
+        # Если не удалось, пробуем еще раз проверить статус без пароля
+        await asyncio.sleep(2)
+        client, status = await session_manager.check_qr_login(user_id)
+        
+        if status == 'success' and client:
+            me = await client.get_me()
+            await update.message.reply_text(
+                f"✅ <b>Успешный вход!</b>\n\n"
+                f"Аккаунт: @{me.username}",
+                parse_mode='HTML'
+            )
+            await show_main_menu(update, context)
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text(
+                "❌ <b>Ошибка входа</b>\n\n"
+                "Попробуйте снова через QR-вход.\n\n"
+                "Убедитесь, что:\n"
+                "1️⃣ Вы отсканировали QR-код\n"
+                "2️⃣ Ввели правильный пароль 2FA в телефоне\n"
+                "3️⃣ Подождали несколько секунд",
+                parse_mode='HTML'
+            )
+            await session_manager.close_session(user_id)
+            return ConversationHandler.END
+
+async def check_qr_login_task(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для проверки QR-входа"""
+    for i in range(30):  # Проверяем 30 раз (каждые 2 секунды = 60 секунд)
+        await asyncio.sleep(2)
+        
+        client, status = await session_manager.check_qr_login(user_id)
+        
+        if status == 'success' and client:
+            me = await client.get_me()
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"✅ <b>Успешный вход!</b>\n\n"
+                        f"Аккаунт: @{me.username} (ID: {me.id})\n"
+                        f"Сессия сохранена в папке sessions/"
+                    ),
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            break
+        elif status == '2fa':
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "🔐 <b>Требуется двухфакторная аутентификация</b>\n\n"
+                        "Введите ваш облачный пароль в Telegram на телефоне,\n"
+                        "затем нажмите 'Проверить вход'."
+                    ),
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            break
+
+async def mailing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение текста рассылки"""
+    context.user_data['mailing_text'] = update.message.text
+    
+    await update.message.reply_text(
+        "👥 <b>Получатели</b>\n\n"
+        "Введите юзернеймы через пробел:\n"
+        "Пример: @user1 @user2 @user3\n\n"
+        "Или 'отмена' для выхода:",
+        parse_mode='HTML'
+    )
+    return MAILING_USERNAMES
+
+async def mailing_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск рассылки"""
+    text = update.message.text.strip()
+    
+    if text.lower() == 'отмена':
+        await update.message.reply_text("❌ Рассылка отменена")
+        return ConversationHandler.END
+    
+    # Парсим юзернеймы
+    usernames = re.findall(r'@(\w+)', text)
+    
+    if not usernames:
+        await update.message.reply_text("❌ Нет юзернеймов. Попробуйте снова:")
+        return MAILING_USERNAMES
+    
+    user_id = update.effective_user.id
+    message_text = context.user_data['mailing_text']
+    
+    # Получаем клиент
+    client = await session_manager.load_session(user_id)
+    
+    if not client:
+        await update.message.reply_text("❌ Сессия не загружена")
+        return ConversationHandler.END
+    
+    # Стартуем рассылку
+    await update.message.reply_text(
+        f"📨 <b>Запуск рассылки</b>\n\n"
+        f"Получателей: {len(usernames)}\n"
+        f"Текст: {message_text[:50]}...",
+        parse_mode='HTML'
+    )
+    
+    # Результаты
+    results = {
+        'success': 0, 'failed': 0, 'blocked': 0,
+        'deactivated': 0, 'flood_wait': 0, 'details': []
+    }
+    
+    status_msg = await update.message.reply_text("🔄 Прогресс: 0%")
+    
+    for i, username in enumerate(usernames):
+        try:
+            # Получаем пользователя
+            try:
+                entity = await client.get_entity(username)
+            except ValueError:
+                results['failed'] += 1
+                results['details'].append(f"❌ @{username} - неверный юзернейм")
+                continue
+            
+            # Отправляем сообщение
+            await client.send_message(entity, message_text)
+            
+            results['success'] += 1
+            results['details'].append(f"✅ @{username} - успешно")
+            
+        except FloodWaitError as e:
+            wait = e.seconds
+            results['flood_wait'] += 1
+            results['details'].append(f"⚠️ @{username} - флуд, ожидание {wait}с")
+            
+            if i % 5 == 0:
+                await update.message.reply_text(f"⏱ Флуд-контроль: ждем {wait}с")
+            
+            await asyncio.sleep(wait)
+            
+        except Exception as e:
+            error = str(e)
+            if "USER_IS_BLOCKED" in error:
+                results['blocked'] += 1
+                results['details'].append(f"❌ @{username}
