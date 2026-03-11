@@ -1,0 +1,3096 @@
+import logging
+import asyncio
+import os
+import re
+import sqlite3
+import io
+import qrcode
+import base64
+import time
+import random
+import json
+import pickle
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
+from collections import defaultdict
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    filters, CallbackQueryHandler, ConversationHandler, ContextTypes
+)
+from telegram.error import TimedOut, NetworkError
+from telethon import TelegramClient, functions, types
+from telethon.errors import (
+    FloodWaitError, 
+    SessionPasswordNeededError,
+    PasswordHashInvalidError,
+    RPCError,
+    ChatAdminRequiredError,
+    UserNotParticipantError,
+    ChatSendMediaForbiddenError,
+    MessageNotModifiedError
+)
+from telethon.tl.types import (
+    CodeSettings, 
+    ChannelParticipantsSearch,
+    User,
+    UserStatusRecently,
+    UserStatusLastWeek,
+    UserStatusLastMonth,
+    MessageEntityTextUrl,
+    MessageEntityUrl,
+    ChannelParticipantsAdmins,
+    ChannelParticipantsBots,
+    ChannelParticipantsRecent
+)
+from telethon.tl.functions.channels import GetParticipantsRequest, GetFullChannelRequest
+from telethon.tl.functions.messages import GetHistoryRequest, GetFullChatRequest
+from telethon.tl.functions.contacts import ResolveUsernameRequest
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== КОНФИГУРАЦИЯ ====================
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Токен бота от @BotFather
+ADMIN_PASSWORD = "12345"  # Пароль для доступа к боту
+CRYPTO_WALLET = ""  # Криптокошелек (будет привязываться через бота)
+PHYSICAL_ACCOUNT_LINK = "https://t.me/mariaazk"  # Ссылка на физ.аккаунт
+API_ID = 12345  # API ID с my.telegram.org
+API_HASH = "your_api_hash_here"  # API Hash с my.telegram.org
+PHOTO_PATH = "worker.jpg"  # Путь к фото
+VIDEO_PATH = "welcome.mp4"  # Путь к видео после авторизации
+SESSIONS_DIR = "sessions"  # Папка с сессиями
+DATA_FILE = "bot_data.pkl"  # Файл для сохранения данных
+
+# Настройки анти-флуда и безопасности
+MAX_NFT_GIFTS = 5  # Максимальное количество NFT подарков для рассылки
+MIN_DELAY_BETWEEN_MESSAGES = 5  # Минимальная задержка между сообщениями (сек)
+MAX_DELAY_BETWEEN_MESSAGES = 15  # Максимальная задержка между сообщениями (сек)
+BATCH_SIZE = 20  # Размер пачки сообщений перед большой паузой
+BATCH_PAUSE = 60  # Пауза после пачки сообщений (сек)
+MESSAGE_VARIATIONS = True  # Варьировать текст сообщения
+MAX_MESSAGES_PER_HOUR = 50  # Максимум сообщений в час
+MAX_MESSAGES_PER_DAY = 200  # Максимум сообщений в день
+
+# Настройки для сбора пользователей из групп
+MAX_USERS_PER_GROUP = 5000  # Максимальное количество пользователей для сбора
+COLLECTION_DELAY = 2  # Задержка между запросами к API (сек)
+PREMIUM_ONLY = True  # Собирать только премиум пользователей
+MAX_MESSAGES_TO_SCAN = 1000  # Максимальное количество сообщений для сканирования
+
+# Настройки для отправки видео
+VIDEO_TIMEOUT = 60  # Таймаут для отправки видео (сек)
+MAX_VIDEO_SIZE = 50 * 1024 * 1024  # Максимальный размер видео (50 MB)
+
+# Настройки для умного режима
+SMART_MODE_RESPONSE_DELAY_MIN = 10  # Минимальная задержка ответа (сек)
+SMART_MODE_RESPONSE_DELAY_MAX = 25  # Максимальная задержка ответа (сек)
+SMART_MODE_CHECK_INTERVAL = 30  # Интервал проверки новых сообщений (сек)
+
+# Тестовый пользователь для проверки теневого бана
+TEST_USER = "@urd7s"
+SPAM_BOT_USERNAME = "@SpamBot"
+
+# ==================== СОСТОЯНИЯ ====================
+ENTER_PASSWORD, TWO_FA_PASSWORD, MAILING_MESSAGE, MAILING_USERNAMES, TRAFFIC_GROUP, TRAFFIC_CHAT, NEW_PROFIT_AMOUNT, BIND_WALLET, MAILING_MODE, CONFIRM_REBIND_WALLET, SESSION_SELECTION = range(11)
+
+# ==================== ПРОВЕРКА КОНФИГУРАЦИИ ====================
+def check_config():
+    """Проверяет наличие всех необходимых параметров"""
+    errors = []
+    
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        errors.append("❌ Не указан BOT_TOKEN")
+    
+    if API_ID == 12345:
+        errors.append("❌ Не указан API_ID")
+    
+    if API_HASH == "your_api_hash_here":
+        errors.append("❌ Не указан API_HASH")
+    
+    if errors:
+        print("\n".join(errors))
+        print("\n⚠️ Исправьте ошибки в конфигурации и перезапустите бота!")
+        return False
+    
+    return True
+
+# ==================== КЛАСС ДЛЯ СОХРАНЕНИЯ ДАННЫХ ====================
+class DataManager:
+    """Класс для сохранения и загрузки данных бота"""
+    
+    def __init__(self, data_file=DATA_FILE):
+        self.data_file = data_file
+        self.user_data = {}  # Данные пользователей бота
+        self.user_wallets = {}  # Привязанные кошельки пользователей
+        self.smart_mode_enabled = defaultdict(bool)  # Статус умного режима для пользователей
+        self.mailing_history = defaultdict(list)  # История рассылок
+        self.smart_mode_tasks = {}  # Задачи умного режима
+        self.sessions_info = {}  # Информация о сессиях
+        self.load_data()
+    
+    def load_data(self):
+        """Загружает данные из файла"""
+        if os.path.exists(self.data_file):
+            try:
+                with open(self.data_file, 'rb') as f:
+                    data = pickle.load(f)
+                    self.user_data = data.get('user_data', {})
+                    self.user_wallets = data.get('user_wallets', {})
+                    self.smart_mode_enabled = data.get('smart_mode_enabled', defaultdict(bool))
+                    self.mailing_history = data.get('mailing_history', defaultdict(list))
+                    self.sessions_info = data.get('sessions_info', {})
+                logger.info(f"✅ Данные загружены из {self.data_file}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки данных: {e}")
+                self.user_data = {}
+                self.user_wallets = {}
+                self.smart_mode_enabled = defaultdict(bool)
+                self.mailing_history = defaultdict(list)
+                self.sessions_info = {}
+        else:
+            logger.info("📁 Файл данных не найден, создаем новые данные")
+            self.user_data = {}
+            self.user_wallets = {}
+            self.smart_mode_enabled = defaultdict(bool)
+            self.mailing_history = defaultdict(list)
+            self.sessions_info = {}
+    
+    def save_data(self):
+        """Сохраняет данные в файл"""
+        try:
+            data = {
+                'user_data': self.user_data,
+                'user_wallets': self.user_wallets,
+                'smart_mode_enabled': dict(self.smart_mode_enabled),
+                'mailing_history': dict(self.mailing_history),
+                'sessions_info': self.sessions_info
+            }
+            with open(self.data_file, 'wb') as f:
+                pickle.dump(data, f)
+            logger.info(f"✅ Данные сохранены в {self.data_file}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения данных: {e}")
+    
+    def get_user_data(self, user_id: int) -> Dict:
+        """Получает данные пользователя"""
+        if user_id not in self.user_data:
+            self.user_data[user_id] = {
+                "authenticated": False, 
+                "profits": [], 
+                "total_cash": 0,
+                "username": None,
+                "selected_session": None
+            }
+        return self.user_data[user_id]
+    
+    def update_user_data(self, user_id: int, data: Dict):
+        """Обновляет данные пользователя"""
+        self.user_data[user_id] = data
+        self.save_data()
+    
+    def get_wallet(self, user_id: int) -> Optional[str]:
+        """Получает кошелек пользователя"""
+        return self.user_wallets.get(user_id)
+    
+    def set_wallet(self, user_id: int, wallet: str):
+        """Устанавливает кошелек пользователя"""
+        self.user_wallets[user_id] = wallet
+        self.save_data()
+    
+    def remove_wallet(self, user_id: int):
+        """Удаляет кошелек пользователя"""
+        if user_id in self.user_wallets:
+            del self.user_wallets[user_id]
+            self.save_data()
+    
+    def add_profit(self, user_id: int, amount: float, profit_type: str):
+        """Добавляет профит пользователю"""
+        user_data = self.get_user_data(user_id)
+        user_data["profits"].append({
+            "amount": amount,
+            "type": profit_type,
+            "date": datetime.now().isoformat()
+        })
+        user_data["total_cash"] += amount
+        self.save_data()
+    
+    def is_smart_mode_enabled(self, user_id: int) -> bool:
+        """Проверяет, включен ли умный режим для пользователя"""
+        return self.smart_mode_enabled.get(user_id, False)
+    
+    def set_smart_mode(self, user_id: int, enabled: bool):
+        """Включает/выключает умный режим"""
+        self.smart_mode_enabled[user_id] = enabled
+        self.save_data()
+    
+    def add_mailing_history(self, user_id: int, mailing_data: Dict):
+        """Добавляет запись в историю рассылок"""
+        self.mailing_history[user_id].append({
+            **mailing_data,
+            "timestamp": datetime.now().isoformat()
+        })
+        self.save_data()
+    
+    def update_session_info(self, user_id: int, session_data: Dict):
+        """Обновляет информацию о сессии"""
+        self.sessions_info[user_id] = {
+            **session_data,
+            "last_updated": datetime.now().isoformat()
+        }
+        self.save_data()
+    
+    def get_session_info(self, user_id: int) -> Optional[Dict]:
+        """Получает информацию о сессии"""
+        return self.sessions_info.get(user_id)
+    
+    def get_selected_session(self, user_id: int) -> Optional[str]:
+        """Получает выбранную сессию пользователя"""
+        user_data = self.get_user_data(user_id)
+        return user_data.get("selected_session")
+    
+    def set_selected_session(self, user_id: int, session_name: str):
+        """Устанавливает выбранную сессию"""
+        user_data = self.get_user_data(user_id)
+        user_data["selected_session"] = session_name
+        self.save_data()
+
+# ==================== КЛАСС ДЛЯ УПРАВЛЕНИЯ РАССЫЛКОЙ ====================
+class MailingManager:
+    """Класс для управления рассылкой с защитой от бана"""
+    
+    def __init__(self):
+        self.stats = {}  # user_id: {"sent": 0, "hourly": 0, "daily": 0, "last_reset": time.time()}
+        self.message_templates = []  # Шаблоны сообщений для вариаций
+        
+    def add_message_template(self, template: str):
+        """Добавляет шаблон сообщения"""
+        self.message_templates.append(template)
+    
+    def get_message_variation(self, original_text: str) -> str:
+        """Возвращает вариацию сообщения"""
+        if not MESSAGE_VARIATIONS or len(self.message_templates) == 0:
+            return original_text
+        
+        # Небольшие изменения в тексте
+        variations = [
+            original_text,
+            original_text + " 🎁",
+            "🎁 " + original_text,
+            original_text.replace("!", "."),
+            original_text + "\n\nПриятного дня!",
+        ]
+        
+        return random.choice(variations)
+    
+    def check_limits(self, user_id: int) -> Tuple[bool, str]:
+        """Проверяет лимиты на отправку"""
+        now = time.time()
+        
+        if user_id not in self.stats:
+            self.stats[user_id] = {
+                "sent": 0, 
+                "hourly": 0, 
+                "daily": 0, 
+                "last_hour_reset": now, 
+                "last_day_reset": now
+            }
+        
+        stats = self.stats[user_id]
+        
+        # Сброс часового счетчика
+        if now - stats.get("last_hour_reset", now) > 3600:
+            stats["hourly"] = 0
+            stats["last_hour_reset"] = now
+        
+        # Сброс дневного счетчика
+        if now - stats.get("last_day_reset", now) > 86400:
+            stats["daily"] = 0
+            stats["last_day_reset"] = now
+        
+        # Проверка лимитов
+        if stats["hourly"] >= MAX_MESSAGES_PER_HOUR:
+            return False, f"Достигнут часовой лимит ({MAX_MESSAGES_PER_HOUR} сообщений)"
+        
+        if stats["daily"] >= MAX_MESSAGES_PER_DAY:
+            return False, f"Достигнут дневной лимит ({MAX_MESSAGES_PER_DAY} сообщений)"
+        
+        return True, "OK"
+    
+    def increment_counters(self, user_id: int):
+        """Увеличивает счетчики отправки"""
+        if user_id in self.stats:
+            self.stats[user_id]["sent"] += 1
+            self.stats[user_id]["hourly"] += 1
+            self.stats[user_id]["daily"] += 1
+    
+    async def get_nft_gift_count(self, client: TelegramClient, user_id: int) -> int:
+        """
+        Получает количество NFT подарков у пользователя
+        Временно используем заглушку
+        """
+        try:
+            # Пытаемся получить информацию о пользователе
+            entity = await client.get_entity(user_id)
+            
+            # Заглушка - возвращаем случайное число
+            return random.randint(0, 10)
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения NFT подарков: {e}")
+            return 0
+
+# ==================== КЛАСС ДЛЯ СБОРА ПОЛЬЗОВАТЕЛЕЙ ИЗ ГРУПП ====================
+class TrafficCollector:
+    """Класс для сбора пользователей из групп Telegram"""
+    
+    def __init__(self):
+        self.collected_users = {}  # user_id: {"group": group_name, "users": [], "premium": [], "time": time.time()}
+    
+    async def get_group_entity(self, client: TelegramClient, group_input: str):
+        """
+        Получает сущность группы по ссылке или юзернейму
+        """
+        try:
+            # Очищаем входные данные
+            group_input = group_input.strip()
+            
+            # Если это ссылка, извлекаем юзернейм
+            if "t.me/" in group_input:
+                group_input = group_input.split("t.me/")[-1].split("/")[0]
+            
+            # Убираем @ если есть
+            if group_input.startswith("@"):
+                group_input = group_input[1:]
+            
+            # Получаем сущность
+            entity = await client.get_entity(group_input)
+            
+            return entity
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения группы: {e}")
+            return None
+    
+    async def collect_users_from_group(
+        self, 
+        client: TelegramClient, 
+        group_entity, 
+        limit: int = MAX_USERS_PER_GROUP,
+        premium_only: bool = PREMIUM_ONLY
+    ) -> Tuple[List[str], Dict[str, int]]:
+        """
+        Собирает пользователей из группы (всех участников)
+        Возвращает (список юзернеймов, статистика)
+        """
+        collected = []
+        stats = {
+            "total": 0,
+            "premium": 0,
+            "regular": 0,
+            "without_username": 0
+        }
+        
+        try:
+            # Получаем участников группы
+            offset = 0
+            batch_size = 200  # Размер пачки для запроса
+            
+            while len(collected) < limit:
+                try:
+                    # Запрашиваем участников
+                    participants = await client(GetParticipantsRequest(
+                        channel=group_entity,
+                        filter=ChannelParticipantsSearch(''),
+                        offset=offset,
+                        limit=batch_size,
+                        hash=0
+                    ))
+                    
+                    if not participants.users:
+                        break
+                    
+                    # Обрабатываем каждого пользователя
+                    for user in participants.users:
+                        if isinstance(user, User) and not user.bot and not user.deleted:
+                            stats["total"] += 1
+                            
+                            # Проверяем наличие премиума
+                            is_premium = getattr(user, 'premium', False)
+                            
+                            if is_premium:
+                                stats["premium"] += 1
+                            else:
+                                stats["regular"] += 1
+                            
+                            # Проверяем, нужно ли собирать этого пользователя
+                            if premium_only and not is_premium:
+                                continue
+                            
+                            # Получаем юзернейм
+                            username = user.username
+                            if username:
+                                collected.append(f"@{username}")
+                            else:
+                                stats["without_username"] += 1
+                    
+                    offset += len(participants.users)
+                    
+                    # Задержка между запросами
+                    await asyncio.sleep(COLLECTION_DELAY)
+                    
+                    # Если получили меньше, чем запрашивали - достигли конца
+                    if len(participants.users) < batch_size:
+                        break
+                        
+                except FloodWaitError as e:
+                    wait_time = e.seconds
+                    logger.warning(f"Флуд при сборе пользователей, ожидание {wait_time}с")
+                    await asyncio.sleep(wait_time + 5)
+                    continue
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка при сборе пользователей: {e}")
+                    break
+            
+            # Обрезаем до лимита
+            collected = collected[:limit]
+            
+            return collected, stats
+            
+        except ChatAdminRequiredError:
+            logger.error("Требуются права администратора для получения списка участников")
+            return [], {"error": "Требуются права администратора"}
+            
+        except Exception as e:
+            logger.error(f"Ошибка сбора пользователей: {e}")
+            return [], {"error": str(e)}
+    
+    async def collect_users_from_chat_messages(
+        self,
+        client: TelegramClient,
+        chat_entity,
+        limit: int = MAX_USERS_PER_GROUP,
+        premium_only: bool = PREMIUM_ONLY,
+        max_messages: int = MAX_MESSAGES_TO_SCAN
+    ) -> Tuple[List[str], Dict[str, int]]:
+        """
+        Собирает пользователей из чата по истории сообщений
+        (только те, кто отправлял сообщения)
+        Возвращает (список юзернеймов, статистика)
+        """
+        collected = set()  # Используем set для уникальности
+        stats = {
+            "total": 0,
+            "premium": 0,
+            "regular": 0,
+            "without_username": 0,
+            "messages_scanned": 0
+        }
+        
+        try:
+            offset_id = 0
+            batch_size = 100
+            
+            while len(collected) < limit and stats["messages_scanned"] < max_messages:
+                try:
+                    # Получаем историю сообщений
+                    history = await client(GetHistoryRequest(
+                        peer=chat_entity,
+                        offset_id=offset_id,
+                        offset_date=None,
+                        add_offset=0,
+                        limit=batch_size,
+                        max_id=0,
+                        min_id=0,
+                        hash=0
+                    ))
+                    
+                    if not history.messages:
+                        break
+                    
+                    for message in history.messages:
+                        stats["messages_scanned"] += 1
+                        
+                        # Получаем информацию об отправителе
+                        if message.sender_id and message.sender_id > 0:  # Только пользователи (не каналы)
+                            try:
+                                user = await client.get_entity(message.sender_id)
+                                
+                                if isinstance(user, User) and not user.bot and not user.deleted:
+                                    # Добавляем в общую статистику
+                                    if user.id not in collected:
+                                        stats["total"] += 1
+                                        
+                                        # Проверяем наличие премиума
+                                        is_premium = getattr(user, 'premium', False)
+                                        
+                                        if is_premium:
+                                            stats["premium"] += 1
+                                        else:
+                                            stats["regular"] += 1
+                                        
+                                        # Проверяем, нужно ли собирать этого пользователя
+                                        if premium_only and not is_premium:
+                                            continue
+                                        
+                                        # Получаем юзернейм
+                                        username = user.username
+                                        if username:
+                                            collected.add(f"@{username}")
+                                        else:
+                                            stats["without_username"] += 1
+                            except Exception as e:
+                                logger.error(f"Ошибка получения информации о пользователе: {e}")
+                    
+                    # Обновляем offset для следующей пачки
+                    offset_id = history.messages[-1].id
+                    
+                    # Задержка между запросами
+                    await asyncio.sleep(COLLECTION_DELAY)
+                    
+                except FloodWaitError as e:
+                    wait_time = e.seconds
+                    logger.warning(f"Флуд при сборе сообщений, ожидание {wait_time}с")
+                    await asyncio.sleep(wait_time + 5)
+                    continue
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка при сборе сообщений: {e}")
+                    break
+            
+            # Конвертируем set в список и обрезаем до лимита
+            collected_list = list(collected)[:limit]
+            
+            return collected_list, stats
+            
+        except Exception as e:
+            logger.error(f"Ошибка сбора пользователей из сообщений: {e}")
+            return [], {"error": str(e)}
+    
+    def save_collected_users(self, user_id: int, group_name: str, users: List[str], stats: Dict, mode: str = "group"):
+        """Сохраняет собранных пользователей"""
+        self.collected_users[user_id] = {
+            "group": group_name,
+            "users": users,
+            "stats": stats,
+            "mode": mode,
+            "time": time.time()
+        }
+    
+    def get_collected_users(self, user_id: int) -> Optional[Dict]:
+        """Получает собранных пользователей"""
+        if user_id in self.collected_users:
+            # Проверяем, не устарели ли данные (старше 1 часа)
+            if time.time() - self.collected_users[user_id]["time"] < 3600:
+                return self.collected_users[user_id]
+        return None
+
+# ==================== КЛАСС ДЛЯ УМНОГО РЕЖИМА ====================
+class SmartModeManager:
+    """Класс для управления умным режимом"""
+    
+    def __init__(self, session_manager):
+        self.session_manager = session_manager
+        self.active_tasks = {}  # user_id: asyncio.Task
+        self.processed_messages = defaultdict(set)  # user_id: set of message_ids
+    
+    async def start_smart_mode(self, user_id: int, context: ContextTypes.DEFAULT_TYPE, recipients: List[str]):
+        """Запускает умный режим для отслеживания ответов"""
+        if user_id in self.active_tasks:
+            # Останавливаем предыдущую задачу
+            self.active_tasks[user_id].cancel()
+        
+        # Создаем новую задачу
+        task = asyncio.create_task(
+            self._smart_mode_worker(user_id, context, recipients)
+        )
+        self.active_tasks[user_id] = task
+    
+    async def stop_smart_mode(self, user_id: int):
+        """Останавливает умный режим"""
+        if user_id in self.active_tasks:
+            self.active_tasks[user_id].cancel()
+            del self.active_tasks[user_id]
+    
+    async def _smart_mode_worker(self, user_id: int, context: ContextTypes.DEFAULT_TYPE, recipients: List[str]):
+        """Фоновая задача для умного режима"""
+        client = await self.session_manager.load_session(user_id)
+        if not client:
+            return
+        
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="🤖 <b>Умный режим активирован!</b>\n\nНачинаю отслеживать ответы пользователей...",
+            parse_mode='HTML'
+        )
+        
+        # Получаем сущности всех получателей
+        recipient_entities = {}
+        for username in recipients:
+            try:
+                entity = await client.get_entity(username)
+                recipient_entities[username] = entity
+            except:
+                continue
+        
+        # Отслеживаем новые сообщения
+        processed = set()
+        
+        while True:
+            try:
+                for username, entity in recipient_entities.items():
+                    try:
+                        # Получаем историю сообщений с пользователем
+                        messages = await client.get_messages(entity, limit=5)
+                        
+                        for msg in messages:
+                            if msg.id in processed:
+                                continue
+                            
+                            # Проверяем, что сообщение от пользователя (не от нас)
+                            if msg.out:
+                                continue
+                            
+                            processed.add(msg.id)
+                            
+                            # Анализируем сообщение
+                            await self._analyze_response(
+                                user_id, context, client, username, msg
+                            )
+                            
+                            # Задержка между ответами
+                            await asyncio.sleep(random.randint(
+                                SMART_MODE_RESPONSE_DELAY_MIN,
+                                SMART_MODE_RESPONSE_DELAY_MAX
+                            ))
+                    
+                    except Exception as e:
+                        logger.error(f"Ошибка при проверке {username}: {e}")
+                
+                # Ждем перед следующей проверкой
+                await asyncio.sleep(SMART_MODE_CHECK_INTERVAL)
+                
+            except asyncio.CancelledError:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="🛑 <b>Умный режим остановлен</b>",
+                    parse_mode='HTML'
+                )
+                break
+            except Exception as e:
+                logger.error(f"Ошибка в умном режиме: {e}")
+                await asyncio.sleep(60)
+    
+    async def _analyze_response(self, user_id: int, context: ContextTypes.DEFAULT_TYPE, 
+                                client: TelegramClient, username: str, message):
+        """Анализирует ответ пользователя"""
+        text = message.message or ""
+        text_lower = text.lower()
+        
+        # Ищем ссылки на каналы
+        channel_links = self._extract_channel_links(text, message)
+        
+        # Проверяем, есть ли канал в профиле
+        channel_in_profile = False
+        if "в профиле" in text_lower or "профиль" in text_lower:
+            channel_in_profile = True
+        
+        # Проверяем, просит ли пользователь реакцию
+        requires_reaction = any(word in text_lower for word in [
+            "реакц", "комментар", "скрин", "подпис", "лайк"
+        ])
+        
+        # Логика обработки
+        if channel_links or channel_in_profile:
+            # Пользователь дал канал - подписываемся
+            await self._handle_channel_response(
+                user_id, context, client, username, channel_links, requires_reaction
+            )
+        else:
+            # Просто уведомляем, что ответ получен
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"💬 <b>@{username}</b> - ответил(а):\n\n{text[:100]}...",
+                parse_mode='HTML'
+            )
+    
+    def _extract_channel_links(self, text: str, message) -> List[str]:
+        """Извлекает ссылки на каналы из сообщения"""
+        links = []
+        
+        # Ищем ссылки в тексте
+        url_pattern = r'(?:https?://)?(?:t\.me/|telegram\.me/)([a-zA-Z0-9_]+)'
+        matches = re.findall(url_pattern, text)
+        for match in matches:
+            links.append(f"https://t.me/{match}")
+        
+        # Ищем ссылки в сущностях сообщения
+        if message.entities:
+            for entity in message.entities:
+                if hasattr(entity, 'url') and entity.url:
+                    links.append(entity.url)
+        
+        return links
+    
+    async def _handle_channel_response(self, user_id: int, context: ContextTypes.DEFAULT_TYPE,
+                                       client: TelegramClient, username: str, 
+                                       channel_links: List[str], requires_reaction: bool):
+        """Обрабатывает ответ с каналом"""
+        
+        # Подписываемся на каналы
+        subscribed = []
+        failed = []
+        
+        for link in channel_links:
+            try:
+                # Получаем сущность канала
+                channel = await client.get_entity(link)
+                
+                # Подписываемся
+                await client(JoinChannelRequest(channel))
+                subscribed.append(link)
+                
+                # Отправляем отчет
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"✅ @{username} - подписался на {link}",
+                    parse_mode='HTML'
+                )
+                
+            except Exception as e:
+                failed.append(link)
+                logger.error(f"Ошибка подписки на {link}: {e}")
+        
+        if subscribed:
+            # Отправляем ответ пользователю
+            await asyncio.sleep(random.randint(
+                SMART_MODE_RESPONSE_DELAY_MIN,
+                SMART_MODE_RESPONSE_DELAY_MAX
+            ))
+            
+            try:
+                entity = await client.get_entity(username)
+                
+                if requires_reaction:
+                    await client.send_message(
+                        entity,
+                        "Я подписалась на ваш канал. Ожидаю вашу заявку на подписку на мой канал. Отправьте скрин, пожалуйста."
+                    )
+                    
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ @{username} - требуется реакция (скрин подписки)",
+                        parse_mode='HTML'
+                    )
+                else:
+                    await client.send_message(
+                        entity,
+                        "Я подписалась, жду твою заявку на подписку на канал. Скинь скрин пожалуйста, что кинули заявку."
+                    )
+                    
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"✅ @{username} - ожидание скрина подписки",
+                        parse_mode='HTML'
+                    )
+            except Exception as e:
+                logger.error(f"Ошибка отправки ответа {username}: {e}")
+        
+        if failed:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"❌ @{username} - не удалось подписаться на {', '.join(failed)}",
+                parse_mode='HTML'
+            )
+
+# ==================== КЛАСС ДЛЯ ПРОВЕРКИ ТЕНЕВОГО БАНА ====================
+class ShadowBanChecker:
+    """Класс для проверки теневого/спам бана"""
+    
+    def __init__(self, session_manager):
+        self.session_manager = session_manager
+    
+    async def check_shadow_ban(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+        """Проверяет наличие теневого/спам бана"""
+        result = {
+            "spam_bot": False,
+            "spam_bot_message": "",
+            "shadow_ban": False,
+            "details": ""
+        }
+        
+        client = await self.session_manager.load_session(user_id)
+        if not client:
+            result["details"] = "❌ Сессия не загружена"
+            return result
+        
+        try:
+            # Шаг 1: Проверка через @SpamBot
+            spam_bot_result = await self._check_spam_bot(client)
+            result["spam_bot"] = spam_bot_result["is_banned"]
+            result["spam_bot_message"] = spam_bot_result["message"]
+            
+            # Шаг 2: Проверка теневого бана (отправка сообщения тестовому пользователю)
+            shadow_ban_result = await self._check_shadow_ban_send(client)
+            result["shadow_ban"] = shadow_ban_result["is_banned"]
+            
+            if not result["shadow_ban"]:
+                # Очищаем переписку с тестовым пользователем
+                await self._clear_chat_with_user(client, TEST_USER)
+            
+            # Формируем детали
+            result["details"] = self._format_result(result)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при проверке бана: {e}")
+            result["details"] = f"❌ Ошибка проверки: {str(e)}"
+        
+        return result
+    
+    async def _check_spam_bot(self, client: TelegramClient) -> Dict[str, Any]:
+        """Проверяет статус через @SpamBot"""
+        result = {
+            "is_banned": False,
+            "message": ""
+        }
+        
+        try:
+            # Получаем сущность SpamBot
+            spam_bot = await client.get_entity(SPAM_BOT_USERNAME)
+            
+            # Отправляем /start
+            await client.send_message(spam_bot, "/start")
+            
+            # Ждем ответа
+            await asyncio.sleep(3)
+            
+            # Получаем последнее сообщение от бота
+            messages = await client.get_messages(spam_bot, limit=1)
+            
+            if messages:
+                msg_text = messages[0].message
+                result["message"] = msg_text
+                
+                # Анализируем сообщение
+                # Если сообщение длинное - скорее всего есть бан
+                if len(msg_text) > 200:
+                    result["is_banned"] = True
+                else:
+                    result["is_banned"] = False
+            
+            # Отправляем второй /start для завершения диалога
+            await client.send_message(spam_bot, "/start")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при проверке SpamBot: {e}")
+            result["message"] = f"Ошибка: {str(e)}"
+        
+        return result
+    
+    async def _check_shadow_ban_send(self, client: TelegramClient) -> Dict[str, Any]:
+        """Проверяет теневой бан отправкой сообщения"""
+        result = {
+            "is_banned": False
+        }
+        
+        try:
+            # Получаем сущность тестового пользователя
+            test_user = await client.get_entity(TEST_USER)
+            
+            # Пробуем отправить сообщение
+            await client.send_message(test_user, ".")
+            
+            # Если дошли сюда - сообщение отправилось (нет теневого бана)
+            result["is_banned"] = False
+            
+        except Exception as e:
+            # Если ошибка - возможно теневой бан
+            error_str = str(e).lower()
+            if "cannot send" in error_str or "forbidden" in error_str or "flood" in error_str:
+                result["is_banned"] = True
+            else:
+                # Другие ошибки (например, пользователь не найден) не считаем баном
+                result["is_banned"] = False
+        
+        return result
+    
+    async def _clear_chat_with_user(self, client: TelegramClient, username: str):
+        """Очищает переписку с пользователем"""
+        try:
+            user = await client.get_entity(username)
+            
+            # Получаем историю сообщений
+            messages = await client.get_messages(user, limit=100)
+            
+            # Удаляем сообщения
+            for msg in messages:
+                if msg.out:  # Только наши сообщения
+                    try:
+                        await msg.delete()
+                    except:
+                        pass
+                
+                await asyncio.sleep(0.5)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при очистке чата с {username}: {e}")
+    
+    def _format_result(self, result: Dict[str, Any]) -> str:
+        """Форматирует результат проверки"""
+        lines = []
+        
+        # Результат SpamBot
+        if result["spam_bot"]:
+            lines.append("🚫 <b>СПАМ БОТ:</b> ОБНАРУЖЕН!")
+        else:
+            lines.append("✅ <b>СПАМ БОТ:</b> не обнаружен")
+        
+        # Результат теневого бана
+        if result["shadow_ban"]:
+            lines.append("🚫 <b>ТЕНЕВОЙ БАН:</b> ОБНАРУЖЕН!")
+        else:
+            lines.append("✅ <b>ТЕНЕВОЙ БАН:</b> не обнаружен")
+        
+        # Сообщение от SpamBot
+        if result["spam_bot_message"]:
+            short_msg = result["spam_bot_message"][:200] + "..." if len(result["spam_bot_message"]) > 200 else result["spam_bot_message"]
+            lines.append(f"\n📝 <b>Сообщение от @SpamBot:</b>\n{short_msg}")
+        
+        return "\n".join(lines)
+
+# ==================== РАБОТА С СЕССИЯМИ ====================
+class SessionManager:
+    """Класс для управления сессиями Telethon"""
+    
+    def __init__(self, sessions_dir=SESSIONS_DIR):
+        self.sessions_dir = sessions_dir
+        self.active_sessions: Dict[int, TelegramClient] = {}
+        self.auth_clients: Dict[int, Dict[str, Any]] = {}
+        self.mailing_manager = MailingManager()
+        self.traffic_collector = TrafficCollector()
+        self.smart_mode_manager = None  # Будет инициализирован после создания
+        
+        # Добавляем шаблоны сообщений для вариаций
+        self.mailing_manager.add_message_template("Привет! У меня для тебя подарок 🎁")
+        self.mailing_manager.add_message_template("Специально для тебя подготовил подарок!")
+        self.mailing_manager.add_message_template("Хочешь получить подарок? 🎀")
+        self.mailing_manager.add_message_template("У меня есть кое-что интересное для тебя ✨")
+        
+        # Создаем папку для сессий
+        os.makedirs(self.sessions_dir, exist_ok=True)
+        
+        logger.info(f"📁 Папка с сессиями: {os.path.abspath(self.sessions_dir)}")
+    
+    def init_smart_mode(self):
+        """Инициализирует менеджер умного режима"""
+        self.smart_mode_manager = SmartModeManager(self)
+        return self.smart_mode_manager
+    
+    def find_session_file(self, user_id: int) -> Optional[str]:
+        """Находит файл сессии для пользователя"""
+        # Сначала ищем по точному имени
+        exact_file = os.path.join(self.sessions_dir, f"{user_id}.session")
+        if os.path.exists(exact_file):
+            return exact_file
+        
+        # Если не нашли, ищем любой .session файл
+        session_files = list(Path(self.sessions_dir).glob("*.session"))
+        if session_files:
+            # Исключаем временные файлы
+            for f in session_files:
+                if not f.name.startswith("temp_"):
+                    return str(f)
+        
+        return None
+    
+    def find_all_session_files(self) -> List[str]:
+        """Находит все файлы сессий в папке"""
+        session_files = list(Path(self.sessions_dir).glob("*.session"))
+        return [str(f) for f in session_files if not f.name.startswith("temp_")]
+    
+    def validate_session_file(self, session_file: str) -> bool:
+        """Проверяет, является ли файл корректной сессией Telethon"""
+        if not os.path.exists(session_file):
+            logger.error(f"❌ Файл не существует: {session_file}")
+            return False
+        
+        # Проверяем размер файла
+        file_size = os.path.getsize(session_file)
+        if file_size < 100:
+            logger.error(f"❌ Файл слишком мал ({file_size} байт): {session_file}")
+            return False
+        
+        # Проверяем, что это SQLite база данных
+        try:
+            conn = sqlite3.connect(session_file)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = cursor.fetchall()
+            conn.close()
+            
+            # Проверяем наличие таблицы sessions
+            table_names = [t[0] for t in tables]
+            if 'sessions' not in table_names:
+                logger.error(f"❌ Файл не содержит таблицу 'sessions': {session_file}")
+                return False
+            
+            logger.info(f"✅ Файл сессии прошел проверку: {session_file}")
+            return True
+            
+        except sqlite3.DatabaseError as e:
+            logger.error(f"❌ Файл не является SQLite базой: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки файла: {e}")
+            return False
+    
+    async def load_session(self, user_id: int, session_name: Optional[str] = None) -> Optional[TelegramClient]:
+        """Загружает сессию для пользователя"""
+        # Если сессия уже загружена, возвращаем её
+        if user_id in self.active_sessions and not session_name:
+            client = self.active_sessions[user_id]
+            try:
+                if client.is_connected() and await client.is_user_authorized():
+                    logger.info(f"✅ Использую уже загруженную сессию для user_id: {user_id}")
+                    return client
+                else:
+                    # Если клиент не работает, удаляем его
+                    del self.active_sessions[user_id]
+            except:
+                del self.active_sessions[user_id]
+        
+        # Если указано имя сессии, ищем конкретный файл
+        if session_name:
+            session_file = os.path.join(self.sessions_dir, session_name)
+            if not os.path.exists(session_file):
+                logger.error(f"❌ Файл сессии не найден: {session_file}")
+                return None
+        else:
+            # Ищем файл сессии по умолчанию
+            session_file = self.find_session_file(user_id)
+            
+            if not session_file:
+                logger.warning(f"⚠️ Файл сессии не найден для user_id: {user_id}")
+                return None
+        
+        # Загружаем сессию
+        try:
+            client = TelegramClient(session_file, API_ID, API_HASH)
+            await client.connect()
+            
+            # Проверяем авторизацию
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                logger.info(f"✅ Сессия успешно загружена для @{me.username} (ID: {me.id})")
+                
+                # Сохраняем информацию о сессии
+                session_info = {
+                    "username": me.username,
+                    "user_id": me.id,
+                    "first_name": me.first_name,
+                    "last_name": me.last_name,
+                    "phone": me.phone,
+                    "file": os.path.basename(session_file)
+                }
+                data_manager.update_session_info(user_id, session_info)
+                
+                # Если файл назывался не по user_id и не указано конкретное имя, переименовываем
+                if not session_name:
+                    expected_name = os.path.join(self.sessions_dir, f"{user_id}.session")
+                    if session_file != expected_name and not os.path.exists(expected_name):
+                        try:
+                            os.rename(session_file, expected_name)
+                            logger.info(f"📝 Файл переименован в {expected_name}")
+                        except:
+                            pass
+                
+                # Сохраняем в активные сессии
+                self.active_sessions[user_id] = client
+                
+                return client
+            else:
+                logger.error(f"❌ Сессия не авторизована: {session_file}")
+                await client.disconnect()
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки сессии: {e}")
+            
+            # Если ошибка связана с базой данных, удаляем файл
+            if "file is not a database" in str(e):
+                logger.warning(f"🗑 Удаляем поврежденный файл: {session_file}")
+                try:
+                    os.remove(session_file)
+                except:
+                    pass
+            
+            return None
+    
+    async def create_qr_client(self, user_id: int) -> TelegramClient:
+        """Создает временного клиента для QR-авторизации"""
+        session_file = os.path.join(self.sessions_dir, f"temp_{user_id}.session")
+        
+        # Удаляем старый временный файл, если есть
+        if os.path.exists(session_file):
+            try:
+                os.remove(session_file)
+            except:
+                pass
+        
+        client = TelegramClient(session_file, API_ID, API_HASH)
+        await client.connect()
+        
+        return client
+    
+    async def generate_qr(self, user_id: int) -> tuple[Optional[bytes], Optional[str]]:
+        """Генерирует QR-код для авторизации"""
+        try:
+            # Создаем временного клиента
+            client = await self.create_qr_client(user_id)
+            
+            # Запрашиваем токен для QR
+            result = await client(functions.auth.ExportLoginTokenRequest(
+                api_id=API_ID,
+                api_hash=API_HASH,
+                except_ids=[]
+            ))
+            
+            # Сохраняем клиент и токен
+            self.auth_clients[user_id] = {
+                'client': client,
+                'token': result.token,
+                'expires': result.expires,
+                'created_at': time.time()
+            }
+            
+            # Формируем ссылку для QR
+            token_b64 = base64.b64encode(result.token).decode('utf-8')
+            qr_link = f"tg://login?token={token_b64}"
+            
+            # Генерируем QR-код
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            
+            qr.add_data(qr_link)
+            qr.make(fit=True)
+            
+            # Создаем изображение
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # Конвертируем в байты
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+            
+            return img_bytes.getvalue(), token_b64
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка генерации QR: {e}")
+            return None, None
+    
+    async def check_qr_login(self, user_id: int, two_fa_password: str = None) -> tuple[Optional[TelegramClient], str]:
+        """
+        Проверяет, выполнен ли вход по QR
+        Возвращает (клиент, статус)
+        Статусы: 'success', '2fa', 'wrong_password', 'expired', 'waiting', 'error'
+        """
+        if user_id not in self.auth_clients:
+            return None, 'no_session'
+        
+        auth_data = self.auth_clients[user_id]
+        client = auth_data['client']
+        
+        try:
+            # Проверяем, не истек ли токен (60 секунд)
+            if time.time() - auth_data['created_at'] > 60:
+                logger.warning(f"⚠️ Токен истек для user_id: {user_id}")
+                return None, 'expired'
+            
+            # Проверяем, авторизован ли уже клиент
+            if await client.is_user_authorized():
+                return await self._finalize_session(user_id, client), 'success'
+            
+            # Если передан пароль 2FA
+            if two_fa_password:
+                try:
+                    # Пробуем войти с паролем
+                    await client.sign_in(password=two_fa_password)
+                    
+                    # Проверяем авторизацию
+                    if await client.is_user_authorized():
+                        return await self._finalize_session(user_id, client), 'success'
+                    else:
+                        return None, 'waiting'
+                        
+                except PasswordHashInvalidError:
+                    return None, 'wrong_password'
+                except SessionPasswordNeededError:
+                    # Все еще требуется 2FA
+                    return None, '2fa'
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при 2FA: {e}")
+                    return None, 'error'
+            
+            # Проверяем, нужно ли ввести пароль 2FA
+            try:
+                # Пытаемся импортировать токен
+                await client(functions.auth.ImportLoginTokenRequest(
+                    token=auth_data['token']
+                ))
+                
+                # Если успешно, проверяем авторизацию
+                if await client.is_user_authorized():
+                    return await self._finalize_session(user_id, client), 'success'
+                else:
+                    return None, 'waiting'
+                    
+            except SessionPasswordNeededError:
+                # Требуется 2FA
+                logger.info(f"🔐 Требуется 2FA для user_id: {user_id}")
+                return None, '2fa'
+                
+            except Exception as e:
+                if "AUTH_TOKEN_ALREADY_ACCEPTED" in str(e):
+                    # Токен уже принят - проверяем авторизацию
+                    if await client.is_user_authorized():
+                        return await self._finalize_session(user_id, client), 'success'
+                
+                logger.debug(f"Ошибка импорта токена: {e}")
+                return None, 'waiting'
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки QR: {e}")
+            return None, 'error'
+    
+    async def _finalize_session(self, user_id: int, client: TelegramClient) -> TelegramClient:
+        """Завершает настройку сессии после успешного входа"""
+        try:
+            me = await client.get_me()
+            logger.info(f"✅ QR-авторизация успешна для @{me.username}")
+            
+            # Сохраняем постоянную сессию
+            permanent_file = os.path.join(self.sessions_dir, f"{user_id}.session")
+            temp_file = os.path.join(self.sessions_dir, f"temp_{user_id}.session")
+            
+            # Сохраняем сессию
+            await client.disconnect()
+            await client.connect()
+            
+            # Перемещаем файл из временного в постоянный
+            if os.path.exists(temp_file):
+                if os.path.exists(permanent_file):
+                    try:
+                        os.remove(permanent_file)
+                    except:
+                        pass
+                try:
+                    os.rename(temp_file, permanent_file)
+                    logger.info(f"📁 Сессия сохранена: {permanent_file}")
+                except Exception as e:
+                    logger.error(f"Ошибка переименования файла: {e}")
+            
+            # Сохраняем информацию о сессии
+            session_info = {
+                "username": me.username,
+                "user_id": me.id,
+                "first_name": me.first_name,
+                "last_name": me.last_name,
+                "phone": me.phone,
+                "file": f"{user_id}.session"
+            }
+            data_manager.update_session_info(user_id, session_info)
+            
+            # Сохраняем в активные сессии
+            self.active_sessions[user_id] = client
+            
+            # Удаляем временные данные
+            if user_id in self.auth_clients:
+                del self.auth_clients[user_id]
+            
+            return client
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при финализации сессии: {e}")
+            return client
+    
+    async def close_session(self, user_id: int):
+        """Закрывает сессию пользователя"""
+        if user_id in self.active_sessions:
+            try:
+                await self.active_sessions[user_id].disconnect()
+            except:
+                pass
+            del self.active_sessions[user_id]
+            logger.info(f"🔒 Сессия закрыта для user_id: {user_id}")
+        
+        # Закрываем временные клиенты
+        if user_id in self.auth_clients:
+            try:
+                await self.auth_clients[user_id]['client'].disconnect()
+            except:
+                pass
+            del self.auth_clients[user_id]
+    
+    async def send_safe_message(self, user_id: int, target_username: str, message: str, mode: str = "normal") -> Tuple[bool, str]:
+        """
+        Отправляет сообщение с защитой от флуд-бана
+        mode: "normal" - обычная рассылка, "nft" - рассылка с проверкой NFT
+        Возвращает (успех, статус)
+        """
+        client = await self.load_session(user_id)
+        
+        if not client:
+            return False, "❌ Сессия не загружена"
+        
+        # Проверяем лимиты
+        can_send, limit_msg = self.mailing_manager.check_limits(user_id)
+        if not can_send:
+            return False, limit_msg
+        
+        try:
+            # Получаем информацию о пользователе
+            try:
+                entity = await client.get_entity(target_username)
+            except ValueError:
+                return False, "❌ Неверный юзернейм"
+            
+            # Если режим NFT, проверяем количество подарков
+            if mode == "nft":
+                nft_count = await self.mailing_manager.get_nft_gift_count(client, entity.id)
+                
+                if nft_count > MAX_NFT_GIFTS:
+                    return False, f"⏭ У пользователя {nft_count} NFT подарков (больше {MAX_NFT_GIFTS})"
+            
+            # Вариация сообщения
+            final_message = self.mailing_manager.get_message_variation(message)
+            
+            # Отправляем сообщение
+            await client.send_message(entity, final_message)
+            
+            # Увеличиваем счетчики
+            self.mailing_manager.increment_counters(user_id)
+            
+            return True, "✅ Сообщение отправлено"
+            
+        except FloodWaitError as e:
+            wait_time = e.seconds
+            logger.warning(f"⏱ Флуд-контроль: ожидание {wait_time}с")
+            
+            # При флуде ждем указанное время + рандом
+            await asyncio.sleep(wait_time + random.randint(5, 15))
+            
+            return False, f"⏱ Флуд-контроль: ожидание {wait_time}с"
+            
+        except Exception as e:
+            error = str(e)
+            if "USER_IS_BLOCKED" in error:
+                return False, "❌ Пользователь заблокировал аккаунт"
+            elif "USER_IS_DEACTIVATED" in error:
+                return False, "❌ Аккаунт удален"
+            else:
+                logger.error(f"Ошибка отправки: {error}")
+                return False, f"❌ Ошибка: {error[:50]}"
+
+# ==================== ИНИЦИАЛИЗАЦИЯ ====================
+data_manager = DataManager()
+session_manager = SessionManager()
+shadow_ban_checker = ShadowBanChecker(session_manager)
+smart_mode_manager = session_manager.init_smart_mode()
+
+# ==================== КЛАВИАТУРЫ ====================
+def get_main_menu_keyboard():
+    """Клавиатура главного меню (обновленный порядок)"""
+    keyboard = [
+        [InlineKeyboardButton("🔥 | Профиль воркера", callback_data="profile")],
+        [InlineKeyboardButton("💰 | Ворк", callback_data="work")],
+        [InlineKeyboardButton("💄 Новый профит", callback_data="new_profit"),
+         InlineKeyboardButton("⚙️ | Настройки", callback_data="settings")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_settings_menu_keyboard():
+    """Клавиатура меню настроек"""
+    keyboard = [
+        [InlineKeyboardButton("📱 | QR-вход", callback_data="qr_auth")],
+        [InlineKeyboardButton("🎁 | Физ.Аккаунт", callback_data="physical", url=PHYSICAL_ACCOUNT_LINK)],
+        [InlineKeyboardButton("💬 | Проверка СБ", callback_data="check_ban")],
+        [InlineKeyboardButton("🔐 | Управление сессиями", callback_data="manage_sessions")],
+        [InlineKeyboardButton("👅 | Вернуться в меню", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_sessions_menu_keyboard(user_id: int):
+    """Клавиатура для управления сессиями"""
+    session_files = session_manager.find_all_session_files()
+    keyboard = []
+    
+    # Получаем информацию о сессиях
+    for session_file in session_files:
+        file_name = os.path.basename(session_file)
+        session_info = data_manager.get_session_info_by_file(file_name)
+        
+        if session_info:
+            display_name = f"📱 @{session_info.get('username', 'Unknown')}"
+        else:
+            display_name = f"📁 {file_name}"
+        
+        # Проверяем, выбрана ли эта сессия
+        selected = data_manager.get_selected_session(user_id)
+        if selected == file_name:
+            display_name = f"✅ {display_name}"
+        
+        keyboard.append([InlineKeyboardButton(display_name, callback_data=f"select_session_{file_name}")])
+    
+    keyboard.append([InlineKeyboardButton("👅 | Назад", callback_data="back_to_settings")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_button():
+    """Кнопка 'Назад'"""
+    keyboard = [[InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_profile_menu_keyboard(user_id: int):
+    """Клавиатура для профиля с динамической кнопкой кошелька"""
+    wallet = data_manager.get_wallet(user_id)
+    
+    if wallet:
+        keyboard = [
+            [InlineKeyboardButton("✅", callback_data="rebind_wallet")],
+            [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+        ]
+    else:
+        keyboard = [
+            [InlineKeyboardButton("🫦 Привязать кошелек", callback_data="bind_wallet")],
+            [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+        ]
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_rebind_wallet_keyboard():
+    """Клавиатура для подтверждения перепривязки кошелька"""
+    keyboard = [
+        [InlineKeyboardButton("✅", callback_data="confirm_rebind")],
+        [InlineKeyboardButton("❌", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_work_menu_keyboard():
+    """Клавиатура меню 'Ворк'"""
+    keyboard = [
+        [InlineKeyboardButton("🦋 | Рассылка", callback_data="mailing")],
+        [InlineKeyboardButton("👾 | Траффик", callback_data="traffic")],
+        [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_traffic_menu_keyboard():
+    """Клавиатура для выбора режима траффика"""
+    keyboard = [
+        [InlineKeyboardButton("🔥 | С группы", callback_data="traffic_group")],
+        [InlineKeyboardButton("🪼 | С чата", callback_data="traffic_chat")],
+        [InlineKeyboardButton("↩️ | Вернуться в меню", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_mailing_mode_keyboard():
+    """Клавиатура для выбора режима рассылки"""
+    keyboard = [
+        [InlineKeyboardButton("📨 Обычная рассылка", callback_data="mailing_mode_normal")],
+        [InlineKeyboardButton("🎁 NFT рассылка (1-5 подарков)", callback_data="mailing_mode_nft")],
+        [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_work")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_smart_mode_button():
+    """Кнопка для включения умного режима"""
+    keyboard = [[InlineKeyboardButton("💦 | Умный режим", callback_data="enable_smart_mode")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_smart_mode_settings_keyboard(enabled: bool):
+    """Клавиатура для настроек умного режима"""
+    status = "✅ Включен" if enabled else "❌ Выключен"
+    keyboard = [
+        [InlineKeyboardButton(f"🤖 Умный режим: {status}", callback_data="toggle_smart_mode")],
+        [InlineKeyboardButton("👅 | Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_qr_menu_keyboard():
+    """Клавиатура для QR-авторизации"""
+    keyboard = [
+        [InlineKeyboardButton("🔄 | Проверить вход", callback_data="check_qr")],
+        [InlineKeyboardButton("❌ | Отмена", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_2fa_menu_keyboard():
+    """Клавиатура для 2FA"""
+    keyboard = [
+        [InlineKeyboardButton("❌ | Отмена", callback_data="cancel_2fa")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_traffic_collect_menu_keyboard():
+    """Клавиатура для сбора траффика"""
+    keyboard = [
+        [InlineKeyboardButton("↩️ | Вернуться в меню", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_new_profit_type_keyboard():
+    """Клавиатура для выбора типа профита"""
+    keyboard = [
+        [InlineKeyboardButton("🎁 Нфт гифты", callback_data="profit_type_nft")],
+        [InlineKeyboardButton("🦅 Траффик", callback_data="profit_type_traffic")],
+        [InlineKeyboardButton("🏦 | Назад", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_to_menu_button():
+    """Кнопка возврата в меню"""
+    keyboard = [[InlineKeyboardButton("👻 Вернуться в меню", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_back_to_settings_button():
+    """Кнопка возврата в настройки"""
+    keyboard = [[InlineKeyboardButton("👅 | Назад", callback_data="back_to_settings")]]
+    return InlineKeyboardMarkup(keyboard)
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+async def send_video_safe(update: Update, video_path: str) -> bool:
+    """
+    Безопасная отправка видео с обработкой ошибок
+    """
+    if not os.path.exists(video_path):
+        logger.warning(f"⚠️ Видео файл не найден: {video_path}")
+        await update.message.reply_text("✅ Авторизация успешна!")
+        return False
+    
+    # Проверяем размер файла
+    file_size = os.path.getsize(video_path)
+    if file_size > MAX_VIDEO_SIZE:
+        logger.warning(f"⚠️ Видео файл слишком большой ({file_size} байт)")
+        await update.message.reply_text("✅ Авторизация успешна!")
+        return False
+    
+    try:
+        # Пробуем отправить видео с таймаутом
+        with open(video_path, 'rb') as video:
+            await update.message.reply_video(
+                video=video,
+                read_timeout=VIDEO_TIMEOUT,
+                write_timeout=VIDEO_TIMEOUT,
+                connect_timeout=VIDEO_TIMEOUT
+            )
+        return True
+    except (TimedOut, NetworkError) as e:
+        logger.error(f"❌ Таймаут при отправке видео: {e}")
+        await update.message.reply_text("✅ Авторизация успешна!")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке видео: {e}")
+        await update.message.reply_text("✅ Авторизация успешна!")
+        return False
+
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    
+    # Получаем данные пользователя
+    user_data = data_manager.get_user_data(user_id)
+    user_data["username"] = username
+    data_manager.update_user_data(user_id, user_data)
+    
+    # Если пользователь уже аутентифицирован, показываем меню
+    if user_data.get("authenticated", False):
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Запрашиваем пароль
+    await update.message.reply_text("🔒 Введите пароль для доступа к боту:")
+    return ENTER_PASSWORD
+
+async def check_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка пароля"""
+    user_id = update.effective_user.id
+    
+    if update.message.text == ADMIN_PASSWORD:
+        user_data = data_manager.get_user_data(user_id)
+        user_data["authenticated"] = True
+        data_manager.update_user_data(user_id, user_data)
+        
+        # Отправляем эмодзи
+        await update.message.reply_text("✅")
+        
+        # Очищаем чат (удаляем предыдущие сообщения)
+        chat_id = update.effective_chat.id
+        try:
+            # Удаляем сообщение с паролем
+            await update.message.delete()
+            
+            # Пытаемся удалить предыдущие сообщения (ограничение Telegram - не старше 48 часов)
+            for i in range(1, 10):
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id - i)
+                except:
+                    pass
+        except:
+            pass
+        
+        # Отправляем видео
+        await send_video_safe(update, VIDEO_PATH)
+        
+        # Показываем главное меню
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("❌ Неверный пароль. Попробуйте /start")
+        return ConversationHandler.END
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ главного меню"""
+    query = update.callback_query
+    
+    text = (
+        "<b>🍷 | Бот воркера</b>\n\n"
+        "<blockquote>• Для начала работы , перейдите в нужный раздел:</blockquote>\n\n"
+        "<b>🦅 | Удачного ворка!</b>"
+    )
+    
+    photo = open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH
+    
+    if query:
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=photo,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+        await query.answer()
+    else:
+        await update.message.reply_photo(
+            photo=photo,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard()
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    user_data = data_manager.get_user_data(user_id)
+    
+    if not user_data.get("authenticated", False):
+        await query.message.reply_text("❌ Авторизуйтесь через /start")
+        await query.answer()
+        return
+    
+    # Обработка выбора сессии
+    if query.data.startswith("select_session_"):
+        session_file = query.data.replace("select_session_", "")
+        data_manager.set_selected_session(user_id, session_file)
+        
+        # Загружаем выбранную сессию
+        client = await session_manager.load_session(user_id, session_file)
+        
+        if client:
+            me = await client.get_me()
+            await query.message.edit_text(
+                f"✅ <b>Сессия выбрана!</b>\n\n"
+                f"Аккаунт: @{me.username}\n"
+                f"Файл: {session_file}",
+                parse_mode='HTML',
+                reply_markup=get_back_to_settings_keyboard()
+            )
+        else:
+            await query.message.edit_text(
+                "❌ <b>Ошибка загрузки сессии</b>",
+                parse_mode='HTML',
+                reply_markup=get_back_to_settings_keyboard()
+            )
+        
+        await query.answer()
+        return
+    
+    # Профиль
+    if query.data == "profile":
+        profits = user_data.get("profits", [])
+        total = user_data.get("total_cash", 0)
+        
+        # Получаем привязанный кошелек
+        wallet = data_manager.get_wallet(user_id)
+        wallet_display = wallet if wallet else "❌"
+        
+        # Получаем выбранную сессию
+        selected_session = data_manager.get_selected_session(user_id)
+        session_display = f"✅ {selected_session}" if selected_session else "❌"
+        
+        text = (
+            f"<b>Мой профиль 🔥</b>\n\n"
+            f"<b>Воркер: #{user_data.get('username', 'moyz3s')}</b>\n"
+            f"• Криптокошелек: {wallet_display}\n"
+            f"• Выбранная сессия: {session_display}\n"
+            f"• Кол-во профитов: {len(profits)}\n"
+            f"Общая касса: {total} руб.\n\n"
+            f"🦅"
+        )
+        
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_profile_menu_keyboard(user_id)
+        )
+        await query.answer()
+    
+    # Привязка кошелька
+    elif query.data == "bind_wallet":
+        await query.message.delete()
+        
+        text = (
+            "<b>🦷 Привязка крипто-кошелька</b>\n\n"
+            "<blockquote>Пришлите адрес вашего крипто-кошелька:</blockquote>\n\n"
+            "<b>‼️ ВАЖНО: АДРЕС ДОЛЖЕН НАЧИНАТЬСЯ С UQ, EQ И СОДЕРЖАТЬ 48 СИМВОЛОВ ‼️</b>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML'
+        )
+        
+        # Переходим в состояние ожидания кошелька
+        return BIND_WALLET
+    
+    # Перепривязка кошелька
+    elif query.data == "rebind_wallet":
+        await query.message.delete()
+        
+        text = (
+            "<b>🙈 | Перепривязка кошелька</b>\n\n"
+            "<blockquote>Действительно ли вы желаете перепривязать свой кошелек?</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_rebind_wallet_keyboard()
+        )
+        await query.answer()
+        return CONFIRM_REBIND_WALLET
+    
+    # Подтверждение перепривязки кошелька
+    elif query.data == "confirm_rebind":
+        # Удаляем старый кошелек
+        data_manager.remove_wallet(user_id)
+        
+        # Переходим к привязке нового
+        await query.message.delete()
+        
+        text = (
+            "<b>🦷 Привязка крипто-кошелька</b>\n\n"
+            "<blockquote>Пришлите адрес вашего крипто-кошелька:</blockquote>\n\n"
+            "<b>‼️ ВАЖНО: АДРЕС ДОЛЖЕН НАЧИНАТЬСЯ С UQ, EQ И СОДЕРЖАТЬ 48 СИМВОЛОВ ‼️</b>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML'
+        )
+        
+        await query.answer()
+        return BIND_WALLET
+    
+    # Новый профит
+    elif query.data == "new_profit":
+        await query.message.delete()
+        
+        text = (
+            "<b>💄 НОВЫЙ ПРОФИТ</b>\n\n"
+            "<blockquote>Выберите тип профита:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_new_profit_type_keyboard()
+        )
+        await query.answer()
+        # Возвращаем None, чтобы не запускать ConversationHandler
+        return None
+    
+    # Тип профита - NFT
+    elif query.data == "profit_type_nft":
+        context.user_data['profit_type'] = "🎁 Нфт гифты"
+        await query.message.delete()
+        
+        text = (
+            "<b>💄 НОВЫЙ ПРОФИТ</b>\n\n"
+            "<blockquote>Введите сумму профита в $:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML'
+        )
+        await query.answer()
+        return NEW_PROFIT_AMOUNT
+    
+    # Тип профита - Траффик
+    elif query.data == "profit_type_traffic":
+        context.user_data['profit_type'] = "🦅 Траффик"
+        await query.message.delete()
+        
+        text = (
+            "<b>💄 НОВЫЙ ПРОФИТ</b>\n\n"
+            "<blockquote>Введите сумму профита в $:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML'
+        )
+        await query.answer()
+        return NEW_PROFIT_AMOUNT
+    
+    # Меню "Ворк"
+    elif query.data == "work":
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption="<blockquote>💼 | Выберите помощник для ворка:</blockquote>",
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Настройки
+    elif query.data == "settings":
+        await query.message.delete()
+        
+        text = (
+            "<b>⚙️ | Настройки</b>\n\n"
+            "<blockquote>Выберите раздел для настройки:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_settings_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Назад в настройки
+    elif query.data == "back_to_settings":
+        await query.message.delete()
+        
+        text = (
+            "<b>⚙️ | Настройки</b>\n\n"
+            "<blockquote>Выберите раздел для настройки:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_settings_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Управление сессиями
+    elif query.data == "manage_sessions":
+        await query.message.delete()
+        
+        text = (
+            "<b>🔐 | Управление сессиями</b>\n\n"
+            "<blockquote>Выберите сессию для использования:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_sessions_menu_keyboard(user_id)
+        )
+        await query.answer()
+    
+    # Проверка теневого бана
+    elif query.data == "check_ban":
+        await query.message.delete()
+        
+        status_msg = await query.message.reply_text(
+            "💬 <b>Проверка теневого/спам бана...</b>\n\n"
+            "Это может занять несколько секунд.",
+            parse_mode='HTML'
+        )
+        
+        # Запускаем проверку
+        result = await shadow_ban_checker.check_shadow_ban(user_id, context)
+        
+        await status_msg.delete()
+        
+        # Отправляем результат
+        await query.message.reply_text(
+            f"<blockquote>{result['details']}</blockquote>",
+            parse_mode='HTML'
+        )
+        
+        # Возвращаемся в меню
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Назад в главное меню
+    elif query.data == "back_to_main":
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Назад в меню ворк
+    elif query.data == "back_to_work":
+        await query.message.delete()
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption="<blockquote>💼 | Выберите помощник для ворка:</blockquote>",
+            parse_mode='HTML',
+            reply_markup=get_work_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Отмена 2FA
+    elif query.data == "cancel_2fa":
+        if user_id in session_manager.auth_clients:
+            await session_manager.close_session(user_id)
+        
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Траффик - показываем выбор режима
+    elif query.data == "traffic":
+        await query.message.delete()
+        
+        text = (
+            "<b>✏️ | Траффик</b>\n\n"
+            "<blockquote>Выберите один из режимов трафферства:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_traffic_menu_keyboard()
+        )
+        await query.answer()
+    
+    # Траффик - с группы
+    elif query.data == "traffic_group":
+        await query.message.delete()
+        
+        # Проверяем, есть ли уже готовая сессия
+        client = await session_manager.load_session(user_id)
+        
+        if not client:
+            await query.message.reply_text(
+                "❌ <b>Сессия не найдена</b>\n\n"
+                "Сначала выполните вход через QR-код или выберите сессию в разделе 'Настройки'",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Текст для раздела Траффик (с группы)
+        text = (
+            "<b>👾 | Траффик</b>\n\n"
+            "<blockquote>Для продолжения , пришлите группу , откуда будут взяты username и отправлены вам.</blockquote>\n\n"
+            "Вернуться в меню?"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_traffic_collect_menu_keyboard()
+        )
+        
+        # Сохраняем режим
+        context.user_data['traffic_mode'] = 'group'
+        context.user_data['waiting_for_group'] = True
+        return TRAFFIC_GROUP
+    
+    # Траффик - с чата (по сообщениям)
+    elif query.data == "traffic_chat":
+        await query.message.delete()
+        
+        # Проверяем, есть ли уже готовая сессия
+        client = await session_manager.load_session(user_id)
+        
+        if not client:
+            await query.message.reply_text(
+                "❌ <b>Сессия не найдена</b>\n\n"
+                "Сначала выполните вход через QR-код или выберите сессию в разделе 'Настройки'",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Текст для раздела Траффик (с чата)
+        text = (
+            "<b>👾 | Траффик</b>\n\n"
+            "<blockquote>Для продолжения , пришлите группу , откуда будут взяты username с чата группы и отправлены вам.</blockquote>\n\n"
+            "Вернуться в меню?"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_traffic_collect_menu_keyboard()
+        )
+        
+        # Сохраняем режим
+        context.user_data['traffic_mode'] = 'chat'
+        context.user_data['waiting_for_group'] = True
+        return TRAFFIC_CHAT
+    
+    # Рассылка - показываем выбор режима
+    elif query.data == "mailing":
+        await query.message.delete()
+        
+        text = (
+            "<b>📨 | Рассылка</b>\n\n"
+            "<blockquote>Выберите режим рассылки:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_mailing_mode_keyboard()
+        )
+        await query.answer()
+    
+    # Режим рассылки - обычный
+    elif query.data == "mailing_mode_normal":
+        context.user_data['mailing_mode'] = 'normal'
+        await query.message.delete()
+        
+        # Проверяем, есть ли кошелек
+        if user_id not in data_manager.user_wallets:
+            await query.message.reply_text(
+                "❌ <b>Кошелек не привязан</b>\n\n"
+                "Сначала привяжите кошелек в разделе 'Профиль воркера'",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Проверяем сессию
+        client = await session_manager.load_session(user_id)
+        
+        if client:
+            # Сессия есть и работает
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Сессия загружена!</b>\n\n"
+                f"Аккаунт: @{me.username}\n"
+                f"Режим: Обычная рассылка\n"
+                f"Настройки анти-флуда:\n"
+                f"• Задержка: {MIN_DELAY_BETWEEN_MESSAGES}-{MAX_DELAY_BETWEEN_MESSAGES}с\n"
+                f"• Пауза после {BATCH_SIZE} сообщений: {BATCH_PAUSE}с\n"
+                f"• Лимит в час: {MAX_MESSAGES_PER_HOUR}\n"
+                f"• Лимит в день: {MAX_MESSAGES_PER_DAY}",
+                parse_mode='HTML'
+            )
+            
+            # Запрашиваем текст рассылки
+            await query.message.reply_text(
+                "📝 <b>Текст рассылки</b>\n\n"
+                "Введите текст сообщения для рассылки\n"
+                "(Сообщения будут автоматически варьироваться для защиты от бана):",
+                parse_mode='HTML'
+            )
+            return MAILING_MESSAGE
+        else:
+            # Сессии нет
+            await query.message.reply_text(
+                "❌ <b>Сессия не найдена</b>\n\n"
+                "Сначала выполните вход через QR-код или выберите сессию в разделе 'Настройки'",
+                parse_mode='HTML'
+            )
+    
+    # Режим рассылки - NFT
+    elif query.data == "mailing_mode_nft":
+        context.user_data['mailing_mode'] = 'nft'
+        await query.message.delete()
+        
+        # Проверяем, есть ли кошелек
+        if user_id not in data_manager.user_wallets:
+            await query.message.reply_text(
+                "❌ <b>Кошелек не привязан</b>\n\n"
+                "Сначала привяжите кошелек в разделе 'Профиль воркера'",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Проверяем сессию
+        client = await session_manager.load_session(user_id)
+        
+        if client:
+            # Сессия есть и работает
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Сессия загружена!</b>\n\n"
+                f"Аккаунт: @{me.username}\n"
+                f"Режим: NFT рассылка (только пользователи с 1-5 подарками)\n"
+                f"Настройки анти-флуда:\n"
+                f"• Макс. NFT подарков: {MAX_NFT_GIFTS}\n"
+                f"• Задержка: {MIN_DELAY_BETWEEN_MESSAGES}-{MAX_DELAY_BETWEEN_MESSAGES}с\n"
+                f"• Пауза после {BATCH_SIZE} сообщений: {BATCH_PAUSE}с\n"
+                f"• Лимит в час: {MAX_MESSAGES_PER_HOUR}\n"
+                f"• Лимит в день: {MAX_MESSAGES_PER_DAY}",
+                parse_mode='HTML'
+            )
+            
+            # Запрашиваем текст рассылки
+            await query.message.reply_text(
+                "📝 <b>Текст рассылки</b>\n\n"
+                "Введите текст сообщения для рассылки\n"
+                "(Сообщения будут автоматически варьироваться для защиты от бана):",
+                parse_mode='HTML'
+            )
+            return MAILING_MESSAGE
+        else:
+            # Сессии нет
+            await query.message.reply_text(
+                "❌ <b>Сессия не найдена</b>\n\n"
+                "Сначала выполните вход через QR-код или выберите сессию в разделе 'Настройки'",
+                parse_mode='HTML'
+            )
+    
+    # Включение умного режима
+    elif query.data == "enable_smart_mode":
+        if 'last_mailing_recipients' not in context.user_data:
+            await query.message.reply_text(
+                "❌ <b>Нет данных для умного режима</b>\n\n"
+                "Сначала выполните обычную рассылку.",
+                parse_mode='HTML'
+            )
+            return
+        
+        recipients = context.user_data['last_mailing_recipients']
+        
+        # Запускаем умный режим
+        await smart_mode_manager.start_smart_mode(user_id, context, recipients)
+        data_manager.set_smart_mode(user_id, True)
+        
+        await query.message.delete()
+        await query.message.reply_text(
+            "<blockquote>✅ Умный режим успешно включен.</blockquote>",
+            parse_mode='HTML'
+        )
+        
+        # Возвращаемся в меню
+        await show_main_menu(update, context)
+        await query.answer()
+    
+    # Переключение умного режима в настройках
+    elif query.data == "toggle_smart_mode":
+        current = data_manager.is_smart_mode_enabled(user_id)
+        
+        if current:
+            await smart_mode_manager.stop_smart_mode(user_id)
+            data_manager.set_smart_mode(user_id, False)
+        else:
+            data_manager.set_smart_mode(user_id, True)
+            # Умный режим будет запущен при следующей рассылке
+        
+        # Обновляем меню настроек
+        await query.message.delete()
+        
+        text = (
+            "<b>⚙️ | Настройки</b>\n\n"
+            "<blockquote>Выберите раздел для настройки:</blockquote>"
+        )
+        
+        await query.message.reply_photo(
+            photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=get_settings_menu_keyboard()
+        )
+        await query.answer()
+    
+    # QR-авторизация
+    elif query.data == "qr_auth":
+        await query.message.delete()
+        
+        # Проверяем, есть ли уже готовая сессия
+        client = await session_manager.load_session(user_id)
+        
+        if client:
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Уже есть активная сессия!</b>\n\n"
+                f"Аккаунт: @{me.username} (ID: {me.id})\n"
+                f"Вы можете выбрать другую сессию в разделе 'Управление сессиями'",
+                parse_mode='HTML'
+            )
+            return
+        
+        # Генерируем QR-код
+        await query.message.reply_text("🔄 Генерирую QR-код для входа...")
+        
+        qr_bytes, token = await session_manager.generate_qr(user_id)
+        
+        if qr_bytes:
+            # Отправляем QR-код
+            await query.message.reply_photo(
+                photo=qr_bytes,
+                caption=(
+                    "📱 <b>QR-код для входа в Telegram</b>\n\n"
+                    "1️⃣ Откройте Telegram на телефоне\n"
+                    "2️⃣ Перейдите в Настройки → Устройства\n"
+                    "3️⃣ Нажмите 'Сканировать QR-код'\n"
+                    "4️⃣ Отсканируйте этот код\n\n"
+                    "⏱ Код действителен 60 секунд\n\n"
+                    "⚠️ <b>Если у вас включена двухфакторная аутентификация (2FA),\n"
+                    "после сканирования потребуется ввести пароль</b>"
+                ),
+                parse_mode='HTML',
+                reply_markup=get_qr_menu_keyboard()
+            )
+            
+            # Запускаем фоновую задачу для проверки входа
+            asyncio.create_task(check_qr_login_task(user_id, context))
+        else:
+            await query.message.reply_text("❌ Ошибка генерации QR-кода")
+    
+    # Проверка QR-входа
+    elif query.data == "check_qr":
+        await query.answer()
+        
+        client, status = await session_manager.check_qr_login(user_id)
+        
+        if status == 'success' and client:
+            me = await client.get_me()
+            await query.message.reply_text(
+                f"✅ <b>Успешный вход!</b>\n\n"
+                f"Аккаунт: @{me.username} (ID: {me.id})\n"
+                f"Сессия сохранена в папке sessions/",
+                parse_mode='HTML'
+            )
+        elif status == '2fa':
+            await query.message.reply_text(
+                "🔐 <b>Требуется двухфакторная аутентификация</b>\n\n"
+                "Введите ваш облачный пароль:",
+                parse_mode='HTML',
+                reply_markup=get_2fa_menu_keyboard()
+            )
+            return TWO_FA_PASSWORD
+        elif status == 'expired':
+            await query.message.reply_text(
+                "❌ <b>Срок действия QR-кода истек</b>\n\n"
+                "Нажмите 'QR-вход' снова, чтобы получить новый код.",
+                parse_mode='HTML'
+            )
+        elif status == 'waiting':
+            await query.message.reply_text(
+                "⏳ Ожидание сканирования QR-кода...\n"
+                "Отсканируйте код в Telegram и нажмите 'Проверить вход' снова."
+            )
+        else:
+            await query.message.reply_text(
+                "⏳ Вход еще не выполнен. Отсканируйте QR-код в Telegram."
+            )
+
+async def traffic_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик отправки ссылки на группу для сбора пользователей (всех участников)"""
+    user_id = update.effective_user.id
+    group_input = update.message.text.strip()
+    
+    if group_input.lower() == 'отмена':
+        context.user_data['waiting_for_group'] = False
+        await update.message.reply_text("❌ Операция отменена")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Получаем клиент
+    client = await session_manager.load_session(user_id)
+    
+    if not client:
+        await update.message.reply_text("❌ Сессия не загружена")
+        return ConversationHandler.END
+    
+    # Отправляем сообщение о начале сбора
+    status_msg = await update.message.reply_text(
+        f"🔄 Начинаю сбор пользователей из группы: {group_input}\n"
+        f"Режим: сбор ВСЕХ участников группы\n"
+        f"Только Premium: {'✅' if PREMIUM_ONLY else '❌'}\n"
+        f"Максимум: {MAX_USERS_PER_GROUP} пользователей\n"
+        f"Это может занять некоторое время..."
+    )
+    
+    try:
+        # Получаем сущность группы
+        group_entity = await session_manager.traffic_collector.get_group_entity(client, group_input)
+        
+        if not group_entity:
+            await status_msg.edit_text(
+                "❌ Не удалось найти группу.\n"
+                "Проверьте ссылку и убедитесь, что аккаунт состоит в этой группе."
+            )
+            return ConversationHandler.END
+        
+        # Собираем пользователей (всех участников)
+        users, stats = await session_manager.traffic_collector.collect_users_from_group(
+            client, 
+            group_entity,
+            limit=MAX_USERS_PER_GROUP,
+            premium_only=PREMIUM_ONLY
+        )
+        
+        if "error" in stats:
+            await status_msg.edit_text(f"❌ Ошибка: {stats['error']}")
+            return ConversationHandler.END
+        
+        # Сохраняем результат
+        group_name = getattr(group_entity, 'title', str(group_entity.id))
+        session_manager.traffic_collector.save_collected_users(user_id, group_name, users, stats, mode="group")
+        
+        # Формируем отчет
+        premium_count = len(users)
+        
+        report = (
+            f"✅ <b>Сбор пользователей (участников группы) завершен!</b>\n\n"
+            f"Группа: {group_name}\n"
+            f"Всего участников: {stats['total']}\n"
+            f"Premium аккаунтов: {stats['premium']}\n"
+            f"Обычных аккаунтов: {stats['regular']}\n"
+            f"Без юзернейма: {stats['without_username']}\n\n"
+            f"<b>Собрано юзернеймов: {premium_count}</b>\n\n"
+        )
+        
+        if users:
+            # Показываем первых 20 пользователей
+            report += "<b>Первые 20 пользователей:</b>\n"
+            for i, username in enumerate(users[:20]):
+                report += f"{i+1}. {username}\n"
+            
+            if len(users) > 20:
+                report += f"... и еще {len(users) - 20}\n\n"
+            
+            # Отправляем файл со всеми юзернеймами
+            filename = f"users_group_{int(time.time())}.txt"
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("\n".join(users))
+            
+            with open(filename, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=filename,
+                    caption=f"📁 Все {len(users)} юзернеймов в файле (участники группы)"
+                )
+            
+            # Удаляем временный файл
+            os.remove(filename)
+        
+        await status_msg.edit_text(report, parse_mode='HTML')
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
+    
+    # Возвращаемся в меню
+    context.user_data['waiting_for_group'] = False
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+async def traffic_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик отправки ссылки на чат для сбора пользователей (по сообщениям)"""
+    user_id = update.effective_user.id
+    group_input = update.message.text.strip()
+    
+    if group_input.lower() == 'отмена':
+        context.user_data['waiting_for_group'] = False
+        await update.message.reply_text("❌ Операция отменена")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Получаем клиент
+    client = await session_manager.load_session(user_id)
+    
+    if not client:
+        await update.message.reply_text("❌ Сессия не загружена")
+        return ConversationHandler.END
+    
+    # Отправляем сообщение о начале сбора
+    status_msg = await update.message.reply_text(
+        f"🔄 Начинаю сбор пользователей из чата: {group_input}\n"
+        f"Режим: сбор АКТИВНЫХ пользователей (по истории сообщений)\n"
+        f"Только Premium: {'✅' if PREMIUM_ONLY else '❌'}\n"
+        f"Максимум: {MAX_USERS_PER_GROUP} пользователей\n"
+        f"Максимум сообщений для сканирования: {MAX_MESSAGES_TO_SCAN}\n"
+        f"Это может занять некоторое время..."
+    )
+    
+    try:
+        # Получаем сущность группы/чата
+        group_entity = await session_manager.traffic_collector.get_group_entity(client, group_input)
+        
+        if not group_entity:
+            await status_msg.edit_text(
+                "❌ Не удалось найти группу/чат.\n"
+                "Проверьте ссылку и убедитесь, что аккаунт состоит в этой группе."
+            )
+            return ConversationHandler.END
+        
+        # Собираем пользователей из истории сообщений
+        users, stats = await session_manager.traffic_collector.collect_users_from_chat_messages(
+            client, 
+            group_entity,
+            limit=MAX_USERS_PER_GROUP,
+            premium_only=PREMIUM_ONLY,
+            max_messages=MAX_MESSAGES_TO_SCAN
+        )
+        
+        if "error" in stats:
+            await status_msg.edit_text(f"❌ Ошибка: {stats['error']}")
+            return ConversationHandler.END
+        
+        # Сохраняем результат
+        group_name = getattr(group_entity, 'title', str(group_entity.id))
+        session_manager.traffic_collector.save_collected_users(user_id, group_name, users, stats, mode="chat")
+        
+        # Формируем отчет
+        premium_count = len(users)
+        
+        report = (
+            f"✅ <b>Сбор пользователей (активных) завершен!</b>\n\n"
+            f"Группа/Чат: {group_name}\n"
+            f"Просканировано сообщений: {stats.get('messages_scanned', 0)}\n"
+            f"Найдено уникальных пользователей: {stats['total']}\n"
+            f"Premium аккаунтов: {stats['premium']}\n"
+            f"Обычных аккаунтов: {stats['regular']}\n"
+            f"Без юзернейма: {stats['without_username']}\n\n"
+            f"<b>Собрано юзернеймов: {premium_count}</b>\n\n"
+        )
+        
+        if users:
+            # Показываем первых 20 пользователей
+            report += "<b>Первые 20 пользователей:</b>\n"
+            for i, username in enumerate(users[:20]):
+                report += f"{i+1}. {username}\n"
+            
+            if len(users) > 20:
+                report += f"... и еще {len(users) - 20}\n\n"
+            
+            # Отправляем файл со всеми юзернеймами
+            filename = f"users_chat_{int(time.time())}.txt"
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("\n".join(users))
+            
+            with open(filename, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=filename,
+                    caption=f"📁 Все {len(users)} юзернеймов в файле (активные пользователи)"
+                )
+            
+            # Удаляем временный файл
+            os.remove(filename)
+        
+        await status_msg.edit_text(report, parse_mode='HTML')
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)}")
+    
+    # Возвращаемся в меню
+    context.user_data['waiting_for_group'] = False
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+async def bind_wallet_handler_func(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик привязки кошелька"""
+    user_id = update.effective_user.id
+    wallet = update.message.text.strip()
+    
+    # Проверяем формат кошелька
+    if not re.match(r'^(UQ|EQ)[A-Za-z0-9]{46}$', wallet):
+        await update.message.reply_text(
+            "❌ <b>Неверный формат кошелька</b>\n\n"
+            "Адрес должен начинаться с UQ или EQ и содержать 48 символов.\n"
+            "Попробуйте снова:",
+            parse_mode='HTML'
+        )
+        return BIND_WALLET
+    
+    # Сохраняем кошелек
+    data_manager.set_wallet(user_id, wallet)
+    await update.message.reply_text("✅")
+    
+    # Возвращаемся в меню
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+async def new_profit_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик суммы нового профита"""
+    user_id = update.effective_user.id
+    amount_text = update.message.text.strip()
+    
+    # Проверяем, что это число
+    try:
+        amount = float(amount_text.replace(',', '.'))
+    except ValueError:
+        await update.message.reply_text(
+            "❌ <b>Неверный формат суммы</b>\n\n"
+            "Введите число (например: 1, 12, 200, 5.5):",
+            parse_mode='HTML'
+        )
+        return NEW_PROFIT_AMOUNT
+    
+    # Проверяем наличие кошелька
+    wallet = data_manager.get_wallet(user_id)
+    if not wallet:
+        await update.message.reply_text(
+            "❌ <b>Кошелек не привязан</b>\n\n"
+            "Сначала привяжите кошелек в разделе 'Профиль воркера'",
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
+    # Получаем тип профита
+    profit_type = context.user_data.get('profit_type', 'Не указан')
+    
+    # Получаем текущую дату
+    current_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+    
+    # Добавляем профит в статистику
+    data_manager.add_profit(user_id, amount, profit_type)
+    
+    # Формируем сообщение о новом профите
+    text = (
+        f"<b>🦅 НОВЫЙ ПРОФИТ!!!</b>\n\n"
+        f" ↓↓↓\n\n"
+        f"<blockquote>→ Дата профита: {current_date}</blockquote>\n"
+        f"<blockquote>→ Воркер: #{data_manager.get_user_data(user_id).get('username', 'moyz3s')}</blockquote>\n"
+        f"<blockquote>→ Криптокошелек: {wallet}</blockquote>\n\n"
+        f"↑ ↑ ↑\n\n"
+        f"→ Тип профита: {profit_type}\n"
+        f"→ Сумма профита в $: {amount}\n\n"
+        f"<blockquote>✅ Заявка поддана на выплату. ✅</blockquote>\n\n"
+        f"<b>‼️ ОЖИДАЕМ ЗАЧИСЛЕНИЯ!!! ‼️</b>"
+    )
+    
+    # Удаляем предыдущее сообщение
+    try:
+        await update.message.delete()
+    except:
+        pass
+    
+    # Отправляем результат
+    await update.message.reply_photo(
+        photo=open(PHOTO_PATH, 'rb') if os.path.exists(PHOTO_PATH) else PHOTO_PATH,
+        caption=text,
+        parse_mode='HTML',
+        reply_markup=get_back_to_menu_button()
+    )
+    
+    # Очищаем данные
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def two_fa_password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ввода пароля 2FA"""
+    user_id = update.effective_user.id
+    password = update.message.text
+    
+    if password.lower() == 'отмена':
+        await session_manager.close_session(user_id)
+        await update.message.reply_text("❌ Вход отменен")
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+    
+    # Отправляем сообщение о проверке
+    status_msg = await update.message.reply_text("🔄 Проверка пароля...")
+    
+    # Пытаемся войти с паролем
+    client, status = await session_manager.check_qr_login(user_id, password)
+    
+    await status_msg.delete()
+    
+    if status == 'success' and client:
+        me = await client.get_me()
+        await update.message.reply_text(
+            f"✅ <b>Успешный вход с 2FA!</b>\n\n"
+            f"Аккаунт: @{me.username} (ID: {me.id})\n"
+            f"Сессия сохранена в папке sessions/",
+            parse_mode='HTML'
+        )
+        await show_main_menu(update, context)
+        return ConversationHandler.END
+        
+    elif status == 'wrong_password':
+        await update.message.reply_text(
+            "❌ <b>Неверный пароль</b>\n\n"
+            "Попробуйте снова или отправьте 'отмена' для выхода:",
+            parse_mode='HTML',
+            reply_markup=get_2fa_menu_keyboard()
+        )
+        return TWO_FA_PASSWORD
+        
+    elif status == 'expired':
+        await update.message.reply_text(
+            "❌ <b>Срок действия QR-кода истек</b>\n\n"
+            "Нажмите 'QR-вход' снова, чтобы получить новый код.",
+            parse_mode='HTML'
+        )
+        await session_manager.close_session(user_id)
+        return ConversationHandler.END
+        
+    else:
+        # Если не удалось, пробуем еще раз проверить статус без пароля
+        await asyncio.sleep(2)
+        client, status = await session_manager.check_qr_login(user_id)
+        
+        if status == 'success' and client:
+            me = await client.get_me()
+            await update.message.reply_text(
+                f"✅ <b>Успешный вход!</b>\n\n"
+                f"Аккаунт: @{me.username}",
+                parse_mode='HTML'
+            )
+            await show_main_menu(update, context)
+            return ConversationHandler.END
+        else:
+            await update.message.reply_text(
+                "❌ <b>Ошибка входа</b>\n\n"
+                "Попробуйте снова через QR-вход.\n\n"
+                "Убедитесь, что:\n"
+                "1️⃣ Вы отсканировали QR-код\n"
+                "2️⃣ Ввели правильный пароль 2FA в телефоне\n"
+                "3️⃣ Подождали несколько секунд",
+                parse_mode='HTML'
+            )
+            await session_manager.close_session(user_id)
+            return ConversationHandler.END
+
+async def check_qr_login_task(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для проверки QR-входа"""
+    for i in range(30):  # Проверяем 30 раз (каждые 2 секунды = 60 секунд)
+        await asyncio.sleep(2)
+        
+        client, status = await session_manager.check_qr_login(user_id)
+        
+        if status == 'success' and client:
+            me = await client.get_me()
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"✅ <b>Успешный вход!</b>\n\n"
+                        f"Аккаунт: @{me.username} (ID: {me.id})\n"
+                        f"Сессия сохранена в папке sessions/"
+                    ),
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            break
+        elif status == '2fa':
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        "🔐 <b>Требуется двухфакторная аутентификация</b>\n\n"
+                        "Введите ваш облачный пароль."
+                    ),
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            break
+
+async def mailing_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение текста рассылки"""
+    context.user_data['mailing_text'] = update.message.text
+    
+    await update.message.reply_text(
+        "👥 <b>Получатели</b>\n\n"
+        "Введите юзернеймы через пробел:\n"
+        "Пример: @user1 @user2 @user3\n\n"
+        "⚠️ <b>Важно:</b>\n"
+        f"• Задержка между сообщениями: {MIN_DELAY_BETWEEN_MESSAGES}-{MAX_DELAY_BETWEEN_MESSAGES}с\n"
+        f"• Пауза после {BATCH_SIZE} сообщений: {BATCH_PAUSE}с\n"
+        f"• Лимит в час: {MAX_MESSAGES_PER_HOUR}\n"
+        f"• Лимит в день: {MAX_MESSAGES_PER_DAY}\n\n"
+        "Или 'отмена' для выхода:",
+        parse_mode='HTML'
+    )
+    return MAILING_USERNAMES
+
+async def mailing_usernames(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запуск рассылки"""
+    text = update.message.text.strip()
+    
+    if text.lower() == 'отмена':
+        await update.message.reply_text("❌ Рассылка отменена")
+        return ConversationHandler.END
+    
+    # Парсим юзернеймы
+    usernames = re.findall(r'@(\w+)', text)
+    
+    if not usernames:
+        await update.message.reply_text("❌ Нет юзернеймов. Попробуйте снова:")
+        return MAILING_USERNAMES
+    
+    user_id = update.effective_user.id
+    message_text = context.user_data['mailing_text']
+    mailing_mode = context.user_data.get('mailing_mode', 'normal')
+    
+    # Сохраняем получателей для умного режима
+    context.user_data['last_mailing_recipients'] = usernames
+    
+    # Проверяем сессию
+    client = await session_manager.load_session(user_id)
+    
+    if not client:
+        await update.message.reply_text("❌ Сессия не загружена")
+        return ConversationHandler.END
+    
+    mode_text = "NFT (1-5 подарков)" if mailing_mode == "nft" else "обычный"
+    
+    # Стартуем рассылку
+    await update.message.reply_text(
+        f"📨 <b>Запуск рассылки</b>\n\n"
+        f"Режим: {mode_text}\n"
+        f"Всего получателей: {len(usernames)}\n"
+        f"Будут обработаны с защитой от флуда...",
+        parse_mode='HTML'
+    )
+    
+    # Результаты
+    results = {
+        'success': 0, 
+        'failed': 0, 
+        'blocked': 0,
+        'deactivated': 0, 
+        'flood_wait': 0, 
+        'nft_skipped': 0,
+        'details': []
+    }
+    
+    status_msg = await update.message.reply_text("🔄 Подготовка к рассылке...")
+    
+    for i, username in enumerate(usernames):
+        # Обновляем статус
+        progress = int(i / len(usernames) * 100)
+        await status_msg.edit_text(
+            f"🔄 Прогресс: {progress}% | Успешно: {results['success']} | Пропущено: {results['failed'] + results['nft_skipped']}"
+        )
+        
+        # Отправляем сообщение с защитой
+        success, status = await session_manager.send_safe_message(user_id, username, message_text, mailing_mode)
+        
+        if success:
+            results['success'] += 1
+            results['details'].append(f"✅ @{username} - успешно")
+        else:
+            if "NFT" in status:
+                results['nft_skipped'] += 1
+                results['details'].append(f"⏭ @{username} - {status}")
+            elif "флуд" in status.lower():
+                results['flood_wait'] += 1
+                results['details'].append(f"⚠️ @{username} - {status}")
+            elif "заблокировал" in status:
+                results['blocked'] += 1
+                results['details'].append(f"❌ @{username} - {status}")
+            elif "удален" in status:
+                results['deactivated'] += 1
+                results['details'].append(f"❌ @{username} - {status}")
+            else:
+                results['failed'] += 1
+                results['details'].append(f"❌ @{username} - {status}")
+        
+        # Задержка между сообщениями (кроме последнего)
+        if i < len(usernames) - 1:
+            # Каждые BATCH_SIZE сообщений делаем большую паузу
+            if (i + 1) % BATCH_SIZE == 0:
+                pause_msg = await update.message.reply_text(
+                    f"⏱ Пауза после {BATCH_SIZE} сообщений на {BATCH_PAUSE} секунд..."
+                )
+                await asyncio.sleep(BATCH_PAUSE)
+                await pause_msg.delete()
+            else:
+                # Обычная случайная задержка
+                delay = random.randint(MIN_DELAY_BETWEEN_MESSAGES, MAX_DELAY_BETWEEN_MESSAGES)
+                await asyncio.sleep(delay)
+    
+    # Финальный прогресс
+    await status_msg.edit_text(f"🔄 Прогресс: 100% | Завершено!")
+    
+    # Получаем статистику
+    stats = session_manager.mailing_manager.stats.get(user_id, {"sent": 0, "hourly": 0, "daily": 0})
+    
+    # Отчет
+    report = (
+        f"📊 <b>Отчет о рассылке</b>\n\n"
+        f"Режим: {mode_text}\n"
+        f"✅ Успешно: {results['success']}\n"
+        f"⏭ Пропущено (NFT > {MAX_NFT_GIFTS}): {results['nft_skipped']}\n"
+        f"❌ Неудачно: {results['failed']}\n"
+        f"🚫 Заблокировали: {results['blocked']}\n"
+        f"💀 Удалены: {results['deactivated']}\n"
+        f"⏱ Флуд: {results['flood_wait']}\n\n"
+        f"📈 <b>Статистика аккаунта:</b>\n"
+        f"Всего отправлено: {stats['sent']}\n"
+        f"Отправлено за час: {stats['hourly']}/{MAX_MESSAGES_PER_HOUR}\n"
+        f"Отправлено за день: {stats['daily']}/{MAX_MESSAGES_PER_DAY}\n\n"
+    )
+    
+    if results['details']:
+        report += "<b>Детали (первые 15):</b>\n"
+        for detail in results['details'][:15]:
+            report += f"{detail}\n"
+        
+        if len(results['details']) > 15:
+            report += f"... и еще {len(results['details']) - 15}"
+    
+    await update.message.reply_text(report, parse_mode='HTML')
+    
+    # Если режим обычный, предлагаем включить умный режим
+    if mailing_mode == "normal" and results['success'] > 0:
+        await update.message.reply_text(
+            "💡 Хотите включить умный режим для отслеживания ответов?",
+            reply_markup=get_smart_mode_button()
+        )
+    
+    # Возвращаемся в меню
+    context.user_data.clear()
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр статистики рассылки"""
+    user_id = update.effective_user.id
+    
+    user_data = data_manager.get_user_data(user_id)
+    wallet = data_manager.get_wallet(user_id)
+    smart_mode = data_manager.is_smart_mode_enabled(user_id)
+    selected_session = data_manager.get_selected_session(user_id)
+    
+    if user_id in session_manager.mailing_manager.stats:
+        stats = session_manager.mailing_manager.stats[user_id]
+        text = (
+            f"📊 <b>Статистика</b>\n\n"
+            f"Кошелек: {wallet if wallet else '❌'}\n"
+            f"Сессия: {selected_session if selected_session else '❌'}\n"
+            f"Умный режим: {'✅' if smart_mode else '❌'}\n"
+            f"Всего отправлено: {stats['sent']}\n"
+            f"За час: {stats['hourly']}/{MAX_MESSAGES_PER_HOUR}\n"
+            f"За день: {stats['daily']}/{MAX_MESSAGES_PER_DAY}\n"
+            f"Всего профитов: {len(user_data.get('profits', []))}\n"
+            f"Общая касса: {user_data.get('total_cash', 0)} руб.\n"
+        )
+    else:
+        text = (
+            f"📊 <b>Статистика</b>\n\n"
+            f"Кошелек: {wallet if wallet else '❌'}\n"
+            f"Сессия: {selected_session if selected_session else '❌'}\n"
+            f"Умный режим: {'✅' if smart_mode else '❌'}\n"
+            f"Всего профитов: {len(user_data.get('profits', []))}\n"
+            f"Общая касса: {user_data.get('total_cash', 0)} руб.\n"
+        )
+    
+    await update.message.reply_text(text, parse_mode='HTML')
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена"""
+    await update.message.reply_text("❌ Отменено")
+    return ConversationHandler.END
+
+# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
+def main():
+    """Запуск бота"""
+    # Проверка конфигурации
+    if not check_config():
+        return
+    
+    print("\n" + "="*70)
+    print("🚀 ЗАПУСК БОТА С УМНЫМ РЕЖИМОМ И ПРОВЕРКОЙ БАНА")
+    print("="*70)
+    print(f"📁 Папка с сессиями: {os.path.abspath(SESSIONS_DIR)}")
+    print(f"📁 Файл данных: {DATA_FILE}")
+    print(f"📁 Видео файл: {VIDEO_PATH}")
+    print(f"\n🔧 НАСТРОЙКИ БЕЗОПАСНОСТИ:")
+    print(f"   • Макс. NFT подарков: {MAX_NFT_GIFTS}")
+    print(f"   • Задержка: {MIN_DELAY_BETWEEN_MESSAGES}-{MAX_DELAY_BETWEEN_MESSAGES}с")
+    print(f"   • Пауза после {BATCH_SIZE} сообщений: {BATCH_PAUSE}с")
+    print(f"   • Лимит в час: {MAX_MESSAGES_PER_HOUR}")
+    print(f"   • Лимит в день: {MAX_MESSAGES_PER_DAY}")
+    print(f"   • Вариация сообщений: {MESSAGE_VARIATIONS}")
+    print(f"\n🤖 НАСТРОЙКИ УМНОГО РЕЖИМА:")
+    print(f"   • Задержка ответа: {SMART_MODE_RESPONSE_DELAY_MIN}-{SMART_MODE_RESPONSE_DELAY_MAX}с")
+    print(f"   • Интервал проверки: {SMART_MODE_CHECK_INTERVAL}с")
+    print(f"\n🔍 ПРОВЕРКА БАНА:")
+    print(f"   • Тестовый пользователь: {TEST_USER}")
+    print(f"   • SpamBot: {SPAM_BOT_USERNAME}")
+    print(f"\n👥 ТРАФФИК:")
+    print(f"   • Макс. пользователей: {MAX_USERS_PER_GROUP}")
+    print(f"   • Только Premium: {PREMIUM_ONLY}")
+    print(f"   • Макс. сообщений для сканирования: {MAX_MESSAGES_TO_SCAN}")
+    
+    # Проверяем наличие библиотеки qrcode
+    try:
+        import qrcode
+        print("\n✅ Библиотека qrcode установлена")
+    except ImportError:
+        print("\n❌ Библиотека qrcode не установлена!")
+        print("   Установите: pip install qrcode[pil]")
+        return
+    
+    # Проверяем наличие видео файла
+    if os.path.exists(VIDEO_PATH):
+        print(f"✅ Видео файл найден: {VIDEO_PATH}")
+    else:
+        print(f"⚠️ Видео файл не найден: {VIDEO_PATH}")
+    
+    # Показываем найденные сессии
+    session_files = list(Path(SESSIONS_DIR).glob("*.session"))
+    if session_files:
+        print(f"\n📂 Найденные сессии:")
+        for f in session_files:
+            size = os.path.getsize(f)
+            status = "✅" if size > 100 else "⚠️"
+            print(f"   {status} {f.name} ({size} байт)")
+    else:
+        print(f"\n📂 В папке {SESSIONS_DIR} нет .session файлов")
+        print(f"   Вы сможете создать сессию через QR-код в боте")
+    
+    print("\n" + "="*70)
+    
+    # Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # ConversationHandler для авторизации в боте
+    auth_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={ENTER_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_password)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    # ConversationHandler для привязки кошелька
+    bind_wallet_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^bind_wallet$')],
+        states={BIND_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_wallet_handler_func)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # ConversationHandler для подтверждения перепривязки кошелька
+    rebind_wallet_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^rebind_wallet$')],
+        states={CONFIRM_REBIND_WALLET: [CallbackQueryHandler(button_handler)]},
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # ConversationHandler для нового профита
+    new_profit_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(button_handler, pattern='^profit_type_nft$'),
+            CallbackQueryHandler(button_handler, pattern='^profit_type_traffic$')
+        ],
+        states={
+            NEW_PROFIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_profit_amount_handler)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # ConversationHandler для рассылки
+    mailing_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(button_handler, pattern='^mailing_mode_normal$'),
+            CallbackQueryHandler(button_handler, pattern='^mailing_mode_nft$')
+        ],
+        states={
+            MAILING_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_message)],
+            MAILING_USERNAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, mailing_usernames)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # ConversationHandler для траффика (с группы)
+    traffic_group_handler_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^traffic_group$')],
+        states={
+            TRAFFIC_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, traffic_group_handler)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # ConversationHandler для траффика (с чата)
+    traffic_chat_handler_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^traffic_chat$')],
+        states={
+            TRAFFIC_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, traffic_chat_handler)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # ConversationHandler для 2FA
+    two_fa_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^check_qr$')],
+        states={
+            TWO_FA_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, two_fa_password_handler)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        allow_reentry=True,
+    )
+    
+    # Добавляем обработчики
+    application.add_handler(auth_handler)
+    application.add_handler(bind_wallet_conv_handler)
+    application.add_handler(rebind_wallet_conv_handler)
+    application.add_handler(new_profit_handler)
+    application.add_handler(two_fa_handler)
+    application.add_handler(mailing_handler)
+    application.add_handler(traffic_group_handler_conv)
+    application.add_handler(traffic_chat_handler_conv)
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler("stats", stats))
+    
+    # Запуск
+    print("✅ Бот запущен и готов к работе!")
+    print("📱 QR-авторизация доступна в разделе 'Настройки'")
+    print("💄 Новый профит - создание профитов с привязкой кошелька")
+    print("📊 Команда /stats для просмотра статистики")
+    print("💾 Данные автоматически сохраняются в bot_data.pkl")
+    print("🤖 Умный режим - отслеживание ответов после рассылки")
+    print("🔍 Проверка СБ - проверка теневого/спам бана")
+    print("👥 Траффик - два режима сбора пользователей (группа/чат)")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
